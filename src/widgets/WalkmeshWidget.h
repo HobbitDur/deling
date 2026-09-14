@@ -26,6 +26,9 @@
 #include "OrientationWidget.h"
 #include "HexLineEdit.h"
 
+class FieldArchive;
+class FieldLoose;
+
 class WalkmeshWidget : public PageWidget
 {
 	Q_OBJECT
@@ -36,7 +39,9 @@ public:
 	void fill();
 	inline QString tabName() const { return tr("Walkmesh"); }
 	int currentCamera() const;
+	void setFieldArchive(FieldArchive *fieldArchive);
 	void restoreWalkmesh(const IdFile::Snapshot &snapshot);
+	void restoreGateways(const QList<Gateway> &gateways);
 public slots:
 	void resetCamera();
 	void setCurrentCamera(int camID);
@@ -60,10 +65,20 @@ private slots:
 	void undoWalkmeshEdit();
 	void redoWalkmeshEdit();
 	void updateEditable();
+	void selectExit(int gate);
+	void startExitDrag();
+	void dragExitEnd(int gate, int end, const Vertex &to);
+	void finishExitDrag();
+	void addExit(const Vertex &a, const Vertex &b);
+	void deleteExit(int gate);
+	void startArrivalPick();
+	void pickArrival(qint16 x, qint16 y, int triangle);
+	void finishArrivalPick();
+	void updateDestinationView();
     void setCurrentGateway(int id);
 	void setCurrentDoor(int id);
 	void editExitPoint(const Vertex &values);
-	void editEntryPoint(const Vertex &values);
+	void editArrival();
 	void editDoorPoint(const Vertex &values);
 	void editFieldId(int v);
 	void editDoorUsed(bool enable);
@@ -104,11 +119,25 @@ private:
 	void applyWalkmeshEdit(const QString &text, const std::function<bool(IdFile *)> &edit);
 	void pushWalkmeshEdit(const QString &text, const IdFile::Snapshot &before);
 	void fillTriangleList();
+	void applyGatewayEdit(const QString &text, const std::function<void(Gateway &)> &edit);
+	void pushGatewaysEdit(const QString &text, const QList<Gateway> &before);
+	void fillGatewayList();
+	QString fieldName(int fieldId) const;
+	int currentFieldId() const;
+	Field *destinationField(int fieldId);
+	void showInView(Field *field, bool isDestination);
 
 	WalkmeshGLWidget *walkmeshGL;
-	QWidget *walkmeshPage;
+	QWidget *walkmeshPage, *gatewaysPage;
 	QUndoStack *undoStack;
 	IdFile::Snapshot dragBefore;
+	QList<Gateway> gatewaysBefore;
+	FieldArchive *fieldArchive;
+	// The field in the view: this page's field, or the destination of the selected exit
+	Field *viewField;
+	bool viewingDestination;
+	// A destination opened from loose files, owned here
+	FieldLoose *looseDestination;
 	QCheckBox *showBackground;
 	QSlider *slider1, *slider2, *slider3;
 	QTabWidget *tabWidget;
@@ -127,7 +156,10 @@ private:
 	QListWidget *gateList;
 	HexLineEdit *unknownGate2;
 	QSpinBox *unknownGate1[4], *fieldId;
-	VertexWidget *exitPoints[2], *entryPoint;
+	QSpinBox *destinationX, *destinationY, *destinationTriangle, *destinationFacing;
+	QLabel *destinationName, *destinationStatus;
+	QCheckBox *showDestination;
+	VertexWidget *exitPoints[2];
 	//DoorPage
 	QListWidget *doorList;
 	QCheckBox *doorUsed;

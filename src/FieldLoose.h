@@ -66,6 +66,12 @@ public:
 	static bool looseExtension(const QString &path, QString &ext);
 	/** Every extension looseExtension() accepts, for the file dialog filter. */
 	static const QStringList &looseExtensions();
+	/**
+	 * Open another field whose files sit near knownPaths, in the folders the game uses
+	 * (mapdata/bc/bcgate1a/bcgate1a.id: a folder per field, grouped by its first two letters).
+	 * Returns nullptr when no walkmesh of that field is found. The caller owns the result.
+	 */
+	static FieldLoose *openNeighbour(const QStringList &knownPaths, const QString &name);
 
 private:
 	QMap<QString, QByteArray> _data;   // extension -> file content

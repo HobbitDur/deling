@@ -47,6 +47,45 @@ bool FieldLoose::looseExtension(const QString &path, QString &ext)
 	return looseExtensions().contains(ext);
 }
 
+FieldLoose *FieldLoose::openNeighbour(const QStringList &knownPaths, const QString &name)
+{
+	if (name.isEmpty()) {
+		return nullptr;
+	}
+
+	for (const QString &knownPath: knownPaths) {
+		const QDir dir = QFileInfo(knownPath).absoluteDir();
+		// mapdata/bc/bcgate1a/ -> mapdata/<prefix>/<name>/, then a sibling folder, then the same one
+		const QStringList candidates = {
+		    dir.absoluteFilePath(QString("../../%1/%2").arg(name.left(2), name)),
+		    dir.absoluteFilePath(QString("../%1").arg(name)),
+		    dir.absolutePath()
+		};
+
+		for (const QString &candidate: candidates) {
+			const QDir fieldDir(candidate);
+
+			if (!fieldDir.exists(name % ".id")) {
+				continue;
+			}
+
+			FieldLoose *field = new FieldLoose(name);
+			for (const QString &ext: looseExtensions()) {
+				const QString path = fieldDir.absoluteFilePath(name % "." % ext);
+				if (QFile::exists(path)) {
+					field->addFile(path);
+				}
+			}
+			field->buildFiles();
+			field->setOpen(true);
+
+			return field;
+		}
+	}
+
+	return nullptr;
+}
+
 bool FieldLoose::addFile(const QString &path)
 {
 	QString ext;

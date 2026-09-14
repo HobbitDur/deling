@@ -19,6 +19,8 @@
 #include "Data.h"
 #include "Config.h"
 #include "ListWidget.h"
+#include "FieldArchive.h"
+#include "FieldLoose.h"
 
 /**
  * One undoable walkmesh edit, kept as the whole walkmesh before and after it. A walkmesh is a few
@@ -46,8 +48,31 @@ private:
 	IdFile::Snapshot _before, _after;
 };
 
+// The same for the 12 exits of the .inf file
+class GatewaysEditCommand : public QUndoCommand
+{
+public:
+	GatewaysEditCommand(WalkmeshWidget *page, const QString &text,
+	                    const QList<Gateway> &before, const QList<Gateway> &after) :
+	    QUndoCommand(text), _page(page), _before(before), _after(after)
+	{
+	}
+	void undo() override
+	{
+		_page->restoreGateways(_before);
+	}
+	void redo() override
+	{
+		_page->restoreGateways(_after);
+	}
+private:
+	WalkmeshWidget *_page;
+	QList<Gateway> _before, _after;
+};
+
 WalkmeshWidget::WalkmeshWidget(QWidget *parent) :
-	PageWidget(parent), walkmeshPage(nullptr)
+	PageWidget(parent), walkmeshPage(nullptr), gatewaysPage(nullptr), fieldArchive(nullptr),
+	viewField(nullptr), viewingDestination(false), looseDestination(nullptr)
 {
 	walkmeshGL = new WalkmeshGLWidget(this);
 	undoStack = new QUndoStack(this);
@@ -81,7 +106,7 @@ void WalkmeshWidget::build()
 	tabWidget = new QTabWidget(this);
 	tabWidget->addTab(buildCameraPage(), tr("Camera"));
 	tabWidget->addTab(walkmeshPage = buildWalkmeshPage(), tr("Walkmesh"));
-	tabWidget->addTab(buildGatewaysPage(), tr("Exits"));
+	tabWidget->addTab(gatewaysPage = buildGatewaysPage(), tr("Exits"));
 	tabWidget->addTab(buildDoorsPage(), tr("Doors"));
 	tabWidget->addTab(buildCameraRangePage(), tr("Camera Ranges"));
 	tabWidget->addTab(buildMovieCameraPage(), tr("Movie Camera"));
@@ -106,14 +131,23 @@ void WalkmeshWidget::build()
 	connect(resetCamera, SIGNAL(clicked()), SLOT(resetCamera()));
 	connect(showBackground, SIGNAL(toggled(bool)), walkmeshGL, SLOT(setBackgroundVisible(bool)));
 
-	// Editing the walkmesh with the mouse
-	connect(tabWidget, &QTabWidget::currentChanged, this, &WalkmeshWidget::updateEditable);
+	// Editing the walkmesh and the exits with the mouse
+	connect(tabWidget, &QTabWidget::currentChanged, this, &WalkmeshWidget::updateDestinationView);
 	connect(walkmeshGL, &WalkmeshGLWidget::pointSelected, this, &WalkmeshWidget::selectTriangleOfPoint);
 	connect(walkmeshGL, &WalkmeshGLWidget::pointDragStarted, this, &WalkmeshWidget::startPointDrag);
 	connect(walkmeshGL, &WalkmeshGLWidget::pointDragged, this, &WalkmeshWidget::dragPoint);
 	connect(walkmeshGL, &WalkmeshGLWidget::pointDragFinished, this, &WalkmeshWidget::finishPointDrag);
 	connect(walkmeshGL, &WalkmeshGLWidget::pointAddRequested, this, &WalkmeshWidget::addPoint);
 	connect(walkmeshGL, &WalkmeshGLWidget::pointDeleteRequested, this, &WalkmeshWidget::deletePoint);
+	connect(walkmeshGL, &WalkmeshGLWidget::exitSelected, this, &WalkmeshWidget::selectExit);
+	connect(walkmeshGL, &WalkmeshGLWidget::exitDragStarted, this, &WalkmeshWidget::startExitDrag);
+	connect(walkmeshGL, &WalkmeshGLWidget::exitEndDragged, this, &WalkmeshWidget::dragExitEnd);
+	connect(walkmeshGL, &WalkmeshGLWidget::exitDragFinished, this, &WalkmeshWidget::finishExitDrag);
+	connect(walkmeshGL, &WalkmeshGLWidget::exitAddRequested, this, &WalkmeshWidget::addExit);
+	connect(walkmeshGL, &WalkmeshGLWidget::exitDeleteRequested, this, &WalkmeshWidget::deleteExit);
+	connect(walkmeshGL, &WalkmeshGLWidget::arrivalPickStarted, this, &WalkmeshWidget::startArrivalPick);
+	connect(walkmeshGL, &WalkmeshGLWidget::arrivalPicked, this, &WalkmeshWidget::pickArrival);
+	connect(walkmeshGL, &WalkmeshGLWidget::arrivalPickFinished, this, &WalkmeshWidget::finishArrivalPick);
 	connect(walkmeshGL, &WalkmeshGLWidget::undoRequested, this, &WalkmeshWidget::undoWalkmeshEdit);
 	connect(walkmeshGL, &WalkmeshGLWidget::redoRequested, this, &WalkmeshWidget::redoWalkmeshEdit);
 
@@ -281,10 +315,30 @@ QWidget *WalkmeshWidget::buildGatewaysPage()
 
 	exitPoints[0] = new VertexWidget(ret);
 	exitPoints[1] = new VertexWidget(ret);
-	entryPoint = new VertexWidget(ret);
 
 	fieldId = new QSpinBox(ret);
 	fieldId->setRange(0, 65535);
+	fieldId->setToolTip(tr("Line of the field in maplist. 32767: unused exit"));
+	destinationName = new QLabel(ret);
+
+	// Where the player stands in the destination field
+	destinationX = new QSpinBox(ret);
+	destinationX->setRange(-32768, 32767);
+	destinationX->setToolTip(tr("32767: centre of the triangle"));
+	destinationY = new QSpinBox(ret);
+	destinationY->setRange(-32768, 32767);
+	destinationTriangle = new QSpinBox(ret);
+	destinationTriangle->setRange(-32768, 32767);
+	destinationTriangle->setToolTip(tr("Triangle of the destination field's walkmesh"));
+	destinationFacing = new QSpinBox(ret);
+	destinationFacing->setRange(0, 255);
+	destinationFacing->setWrapping(true);
+
+	showDestination = new QCheckBox(tr("Show destination"), ret);
+	showDestination->setToolTip(tr("Show the destination field in the view, and click its floor to choose where the player arrives"));
+	destinationStatus = new QLabel(ret);
+	destinationStatus->setTextFormat(Qt::PlainText);
+	destinationStatus->setWordWrap(true);
 
 	for (int i = 0; i < 4; ++i) {
 		unknownGate1[i] = new QSpinBox(ret);
@@ -292,32 +346,58 @@ QWidget *WalkmeshWidget::buildGatewaysPage()
 	}
 	unknownGate2 = new HexLineEdit(ret);
 
-	QGridLayout *idsLayout = new QGridLayout;
-	idsLayout->addWidget(new QLabel(tr("Field ID:")), 0, 0);
-	idsLayout->addWidget(fieldId, 0, 1, 1, 4);
-	idsLayout->addWidget(new QLabel(tr("Unknown 1:")), 1, 0);
-	idsLayout->addWidget(unknownGate1[0], 1, 1);
-	idsLayout->addWidget(unknownGate1[1], 1, 2);
-	idsLayout->addWidget(unknownGate1[2], 1, 3);
-	idsLayout->addWidget(unknownGate1[3], 1, 4);
-	idsLayout->addWidget(new QLabel(tr("Unknown 2:")), 2, 0);
-	idsLayout->addWidget(unknownGate2, 2, 1, 1, 4);
+	QLabel *exitInfos = new QLabel(tr("Drag an exit end to move it: dropped near a walkmesh point, it goes on it. "
+	                                  "Click near a wall to add an exit there, leading where the selected exit leads. "
+	                                  "Delete disables the selected exit."), ret);
+	exitInfos->setTextFormat(Qt::PlainText);
+	exitInfos->setWordWrap(true);
+
+	QHBoxLayout *destinationLayout = new QHBoxLayout;
+	destinationLayout->addWidget(fieldId);
+	destinationLayout->addWidget(destinationName, 1);
+	destinationLayout->addWidget(showDestination);
+
+	QHBoxLayout *arrivalLayout = new QHBoxLayout;
+	arrivalLayout->addWidget(new QLabel(tr("X")));
+	arrivalLayout->addWidget(destinationX, 1);
+	arrivalLayout->addWidget(new QLabel(tr("Y")));
+	arrivalLayout->addWidget(destinationY, 1);
+	arrivalLayout->addWidget(new QLabel(tr("Triangle")));
+	arrivalLayout->addWidget(destinationTriangle, 1);
+	arrivalLayout->addWidget(new QLabel(tr("Facing")));
+	arrivalLayout->addWidget(destinationFacing, 1);
+
+	QHBoxLayout *unknownLayout = new QHBoxLayout;
+	for (int i = 0; i < 4; ++i) {
+		unknownLayout->addWidget(unknownGate1[i], 1);
+	}
+	unknownLayout->addWidget(unknownGate2, 1);
 
 	QGridLayout *layout = new QGridLayout(ret);
-	layout->addWidget(gateList, 0, 0, 5, 1, Qt::AlignLeft);
-	layout->addWidget(new QLabel(tr("Exit Line:")), 0, 1);
+	layout->addWidget(gateList, 0, 0, 8, 1, Qt::AlignLeft);
+	layout->addWidget(new QLabel(tr("Exit line:")), 0, 1);
 	layout->addWidget(exitPoints[0], 0, 2);
 	layout->addWidget(exitPoints[1], 1, 2);
-	layout->addWidget(new QLabel(tr("Destination point:")), 2, 1);
-	layout->addWidget(entryPoint, 2, 2);
-	layout->addLayout(idsLayout, 3, 1, 1, 2);
-	layout->setRowStretch(4, 1);
+	layout->addWidget(new QLabel(tr("Destination:")), 2, 1);
+	layout->addLayout(destinationLayout, 2, 2);
+	layout->addWidget(new QLabel(tr("Arrival:")), 3, 1);
+	layout->addLayout(arrivalLayout, 3, 2);
+	layout->addWidget(new QLabel(tr("Unknown:")), 4, 1);
+	layout->addLayout(unknownLayout, 4, 2);
+	layout->addWidget(destinationStatus, 5, 1, 1, 2);
+	layout->addWidget(exitInfos, 6, 1, 1, 2);
+	layout->setRowStretch(7, 1);
+	layout->setColumnStretch(2, 1);
 
 	connect(gateList, SIGNAL(currentRowChanged(int)), SLOT(setCurrentGateway(int)));
 	connect(exitPoints[0], SIGNAL(valuesChanged(Vertex)), SLOT(editExitPoint(Vertex)));
 	connect(exitPoints[1], SIGNAL(valuesChanged(Vertex)), SLOT(editExitPoint(Vertex)));
-	connect(entryPoint, SIGNAL(valuesChanged(Vertex)), SLOT(editEntryPoint(Vertex)));
 	connect(fieldId, SIGNAL(valueChanged(int)), SLOT(editFieldId(int)));
+	connect(destinationX, SIGNAL(valueChanged(int)), SLOT(editArrival()));
+	connect(destinationY, SIGNAL(valueChanged(int)), SLOT(editArrival()));
+	connect(destinationTriangle, SIGNAL(valueChanged(int)), SLOT(editArrival()));
+	connect(destinationFacing, SIGNAL(valueChanged(int)), SLOT(editArrival()));
+	connect(showDestination, SIGNAL(toggled(bool)), SLOT(updateDestinationView()));
 	for (int i = 0; i < 4; ++i) {
 		connect(unknownGate1[i], SIGNAL(valueChanged(int)), SLOT(editUnknownGate(int)));
 	}
@@ -490,6 +570,10 @@ void WalkmeshWidget::clear()
 
 	walkmeshGL->clear();
 	undoStack->clear();
+	viewField = nullptr;
+	viewingDestination = false;
+	delete looseDestination;
+	looseDestination = nullptr;
 
 	blockSignals(true);
 	camList->clear();
@@ -523,7 +607,10 @@ void WalkmeshWidget::setReadOnly(bool ro)
 		// GatePage
 		exitPoints[0]->setReadOnly(ro);
 		exitPoints[1]->setReadOnly(ro);
-		entryPoint->setReadOnly(ro);
+		destinationX->setReadOnly(ro);
+		destinationY->setReadOnly(ro);
+		destinationTriangle->setReadOnly(ro);
+		destinationFacing->setReadOnly(ro);
 		fieldId->setReadOnly(ro);
 		for (int i=0 ; i<4 ; ++i) 	unknownGate1[i]->setReadOnly(ro);
 		unknownGate2->setReadOnly(ro);
@@ -565,6 +652,8 @@ void WalkmeshWidget::fill()
 			 && !data()->hasInfFile())) return;
 
 	walkmeshGL->fill(data());
+	viewField = data();
+	viewingDestination = false;
 	// Nothing to show or hide when the field was opened without its map/mim
 	showBackground->setEnabled(data()->hasBackgroundFile());
 
@@ -595,13 +684,7 @@ void WalkmeshWidget::fill()
 
 	if (data()->hasInfFile()) {
 		gateList->clear();
-		for (const Gateway &gateway: data()->getInfFile()->getGateways()) {
-			if (gateway.fieldId != 0x7FFF) {
-				gateList->addItem(QString("%1 (%2)").arg(Data::maplist().value(gateway.fieldId)).arg(gateway.fieldId));
-			} else {
-				gateList->addItem(tr("Unused"));
-			}
-		}
+		fillGatewayList();
 		gateList->setCurrentRow(0);
 		setCurrentGateway(0);
 
@@ -643,7 +726,7 @@ void WalkmeshWidget::fill()
 //	tabWidget->widget(5)->setEnabled(data()->hasMskFile());
 
 	PageWidget::fill();
-	updateEditable();
+	updateDestinationView();
 }
 
 void WalkmeshWidget::fillTriangleList()
@@ -940,12 +1023,23 @@ void WalkmeshWidget::redoWalkmeshEdit()
 	undoStack->redo();
 }
 
-// Points are edited on the Walkmesh tab only: the same view is shown on the camera, exits and
-// doors tabs, where a click is not meant to change the walkmesh
+// The same view is shown on every tab: a click edits the walkmesh on the Walkmesh tab, the exits
+// on the Exits tab, and nothing elsewhere
 void WalkmeshWidget::updateEditable()
 {
-	walkmeshGL->setEditable(tabWidget->currentWidget() == walkmeshPage && !isReadOnly()
-	                        && hasData() && data()->hasIdFile());
+	WalkmeshGLWidget::EditMode mode = WalkmeshGLWidget::NoEdit;
+
+	if (hasData() && !isReadOnly()) {
+		if (viewingDestination) {
+			mode = WalkmeshGLWidget::PickArrival;
+		} else if (tabWidget->currentWidget() == walkmeshPage && data()->hasIdFile()) {
+			mode = WalkmeshGLWidget::EditWalkmesh;
+		} else if (tabWidget->currentWidget() == gatewaysPage && data()->hasInfFile()) {
+			mode = WalkmeshGLWidget::EditExits;
+		}
+	}
+
+	walkmeshGL->setEditMode(mode);
 }
 
 void WalkmeshWidget::applyWalkmeshEdit(const QString &text, const std::function<bool(IdFile *)> &edit)
@@ -1057,25 +1151,179 @@ void WalkmeshWidget::editIdAccess(int id, int value)
 
 void WalkmeshWidget::setCurrentGateway(int id)
 {
-	if (!data()->hasInfFile() || id < 0)    return;
+	if (!hasData() || !data()->hasInfFile() || id < 0 || id >= 12) {
+		return;
+	}
 
-	InfFile *inf = data()->getInfFile();
-	if (12 <= id)    return;
+	const Gateway &gateway = data()->getInfFile()->getGateway(id);
 
-	const Gateway &gateway = inf->getGateway(id);
+	{
+		// Filling the form is not an edit: each box would otherwise record the gateway with
+		// the boxes after it still showing the previous exit
+		QSignalBlocker b0(exitPoints[0]), b1(exitPoints[1]), b2(fieldId), b3(destinationX), b4(destinationY),
+		               b5(destinationTriangle), b6(destinationFacing), b7(unknownGate1[0]), b8(unknownGate1[1]),
+		               b9(unknownGate1[2]), b10(unknownGate1[3]), b11(unknownGate2);
 
-	exitPoints[0]->setValues(gateway.exitLine[0]);
-	exitPoints[1]->setValues(gateway.exitLine[1]);
-	entryPoint->setValues(gateway.destinationPoint);
-	fieldId->setValue(gateway.fieldId);
-	unknownGate1[0]->setValue(gateway.unknown1[0]);
-	unknownGate1[1]->setValue(gateway.unknown1[1]);
-	unknownGate1[2]->setValue(gateway.unknown1[2]);
-	unknownGate1[3]->setValue(gateway.unknown1[3]);
+		exitPoints[0]->setValues(gateway.exitLine[0]);
+		exitPoints[1]->setValues(gateway.exitLine[1]);
+		fieldId->setValue(gateway.fieldId);
+		destinationX->setValue(gateway.destinationX);
+		destinationY->setValue(gateway.destinationY);
+		destinationTriangle->setValue(gateway.destinationTriangle);
+		destinationFacing->setValue(gateway.destinationFacing);
+		for (int i = 0; i < 4; ++i) {
+			unknownGate1[i]->setValue(gateway.unknown1[i]);
+		}
+		unknownGate2->setData(QByteArray((char *)gateway.unknown2, 3));
+	}
 
-	unknownGate2->setData(QByteArray((char *)&gateway.unknown2, 4));
-
+	destinationName->setText(fieldName(gateway.fieldId));
 	walkmeshGL->setSelectedGate(id);
+	updateDestinationView();
+}
+
+QString WalkmeshWidget::fieldName(int fieldId) const
+{
+	if (fieldId == GATEWAY_UNUSED) {
+		return tr("Unused");
+	}
+
+	const QStringList &mapList = fieldArchive != nullptr ? fieldArchive->mapList() : Data::maplist();
+	const QString name = mapList.value(fieldId, tr("Unknown field"));
+
+	return fieldId < GATEWAY_FIRST_FIELD ? tr("%1 (world map)").arg(name) : name;
+}
+
+// This page's field id, which is its line in maplist
+int WalkmeshWidget::currentFieldId() const
+{
+	const QStringList &mapList = fieldArchive != nullptr ? fieldArchive->mapList() : Data::maplist();
+
+	return mapList.indexOf(data()->name());
+}
+
+void WalkmeshWidget::fillGatewayList()
+{
+	InfFile *inf = data()->getInfFile();
+
+	for (int i = 0; i < 12; ++i) {
+		const Gateway &gateway = inf->getGateway(i);
+		const QString text = gateway.fieldId == GATEWAY_UNUSED ? tr("Unused")
+		                     : QString("%1 (%2)").arg(fieldName(gateway.fieldId)).arg(gateway.fieldId);
+
+		if (i < gateList->count()) {
+			gateList->item(i)->setText(text);
+		} else {
+			gateList->addItem(text);
+		}
+	}
+}
+
+void WalkmeshWidget::setFieldArchive(FieldArchive *fieldArchive)
+{
+	this->fieldArchive = fieldArchive;
+}
+
+/**
+ * The field an exit leads to, with what the view needs loaded: from the archive when there is
+ * one, otherwise from the folders next to the loose files (see FieldLoose::openNeighbour).
+ */
+Field *WalkmeshWidget::destinationField(int fieldId)
+{
+	if (fieldArchive != nullptr) {
+		Field *field = fieldArchive->getFieldFromMapId(fieldId);
+		if (field != nullptr && field != data()) {
+			fieldArchive->openFull(field);
+		}
+		return field;
+	}
+
+	FieldLoose *loose = dynamic_cast<FieldLoose *>(data());
+	if (loose == nullptr) {
+		return nullptr;
+	}
+
+	const QString name = Data::maplist().value(fieldId);
+	if (name == loose->name()) {
+		return loose;
+	}
+	if (looseDestination == nullptr || looseDestination->name() != name) {
+		delete looseDestination;
+		looseDestination = FieldLoose::openNeighbour(loose->paths(), name);
+	}
+
+	return looseDestination;
+}
+
+void WalkmeshWidget::showInView(Field *field, bool isDestination)
+{
+	if (field != viewField) {
+		Field *previous = viewField;
+
+		walkmeshGL->fill(field);
+		// A destination is shown through its first camera; this field through the chosen one
+		walkmeshGL->setCurrentFieldCamera(isDestination ? 0 : currentCamera());
+		viewField = field;
+
+		// The background of a destination from the archive is big and only needed while it is
+		// shown: the archive reads it again next time (MainWindow::fillPage does the same)
+		if (fieldArchive != nullptr && previous != nullptr && previous != data() && !previous->isModified()) {
+			previous->deleteFile(Field::Background);
+		}
+	}
+
+	viewingDestination = isDestination;
+}
+
+/**
+ * With "Show destination" ticked on the Exits tab, the view shows the field the selected exit
+ * leads to, where a click places the arrival; otherwise it shows this page's field.
+ */
+void WalkmeshWidget::updateDestinationView()
+{
+	if (!hasData() || !isBuilded()) {
+		return;
+	}
+
+	const int gateId = gateList->currentRow();
+	Field *destination = nullptr;
+	QString status;
+
+	if (showDestination->isChecked() && tabWidget->currentWidget() == gatewaysPage
+	        && data()->hasInfFile() && gateId >= 0 && gateId < 12) {
+		const Gateway &gateway = data()->getInfFile()->getGateway(gateId);
+
+		if (gateway.fieldId == GATEWAY_UNUSED) {
+			status = tr("This exit is unused.");
+		} else if (gateway.fieldId < GATEWAY_FIRST_FIELD) {
+			status = tr("This exit leads to the world map.");
+		} else {
+			destination = destinationField(gateway.fieldId);
+
+			if (destination == nullptr || !destination->hasIdFile()) {
+				destination = nullptr;
+				status = tr("The walkmesh of %1 was not found: open field.fs, or keep the field folders "
+				            "next to each other as in mapdata.").arg(fieldName(gateway.fieldId));
+			} else if (gateway.destinationTriangle < 0
+			           || gateway.destinationTriangle >= destination->getIdFile()->triangleCount()) {
+				status = tr("Triangle %1 does not exist in %2: the player would arrive nowhere. "
+				            "Click the floor to choose a place.").arg(gateway.destinationTriangle).arg(fieldName(gateway.fieldId));
+			} else {
+				status = tr("Click the floor of %1 to choose where the player arrives.").arg(fieldName(gateway.fieldId));
+			}
+
+			if (destination != nullptr) {
+				walkmeshGL->setArrival(gateway.destinationX, gateway.destinationY, gateway.destinationTriangle);
+			}
+		}
+	}
+
+	if (data()->hasCaFile() || data()->hasIdFile() || data()->hasInfFile()) {
+		showInView(destination != nullptr ? destination : data(), destination != nullptr);
+	}
+
+	destinationStatus->setText(status);
+	updateEditable();
 }
 
 void WalkmeshWidget::setCurrentDoor(int id)
@@ -1111,31 +1359,174 @@ void WalkmeshWidget::editExitPoint(const Vertex &values)
 
 void WalkmeshWidget::editExitPoint(int id, const Vertex &values)
 {
-	if (data()->hasInfFile()) {
-		int gateId = gateList->currentRow();
-		Gateway old = data()->getInfFile()->getGateway(gateId);
-		Vertex oldVertex = old.exitLine[id];
-		if (oldVertex.x != values.x || oldVertex.y != values.y || oldVertex.z != values.z) {
-			old.exitLine[id] = values;
-			data()->getInfFile()->setGateway(gateId, old);
-			walkmeshGL->update();
-			emit modified();
+	applyGatewayEdit(tr("Move exit"), [&](Gateway &gateway) {
+		gateway.exitLine[id] = values;
+	});
+}
+
+void WalkmeshWidget::editArrival()
+{
+	applyGatewayEdit(tr("Move arrival"), [&](Gateway &gateway) {
+		gateway.destinationX = qint16(destinationX->value());
+		gateway.destinationY = qint16(destinationY->value());
+		gateway.destinationTriangle = qint16(destinationTriangle->value());
+		gateway.destinationFacing = quint8(destinationFacing->value());
+	});
+}
+
+void WalkmeshWidget::selectExit(int gate)
+{
+	gateList->setCurrentRow(gate);
+}
+
+// Like a walkmesh point, a drag is one undo step
+void WalkmeshWidget::startExitDrag()
+{
+	gatewaysBefore = data()->getInfFile()->getGateways();
+}
+
+void WalkmeshWidget::dragExitEnd(int gate, int end, const Vertex &to)
+{
+	Gateway gateway = data()->getInfFile()->getGateway(gate);
+	gateway.exitLine[end] = to;
+	data()->getInfFile()->setGateway(gate, gateway);
+
+	if (gate == gateList->currentRow()) {
+		QSignalBlocker blocker(exitPoints[end]);
+		exitPoints[end]->setValues(to);
+	}
+
+	walkmeshGL->update();
+}
+
+void WalkmeshWidget::finishExitDrag()
+{
+	pushGatewaysEdit(tr("Move exit"), gatewaysBefore);
+}
+
+void WalkmeshWidget::addExit(const Vertex &a, const Vertex &b)
+{
+	InfFile *inf = data()->getInfFile();
+	const QList<Gateway> before = inf->getGateways();
+	const int selected = gateList->currentRow();
+	int slot = -1;
+
+	for (int i = 0; i < before.size() && slot < 0; ++i) {
+		if (before.at(i).fieldId == GATEWAY_UNUSED) {
+			slot = i;
 		}
+	}
+
+	if (slot < 0) {
+		return; // the file holds 12 exits, all used
+	}
+
+	Gateway gateway = {};
+
+	// Exits often come in groups leading to the same place (a wide passage cut in several
+	// lines), so a new exit leads where the selected one does; otherwise back into this field
+	if (selected >= 0 && selected < before.size() && before.at(selected).fieldId != GATEWAY_UNUSED) {
+		gateway = before.at(selected);
+	} else {
+		const int thisField = currentFieldId();
+		gateway.fieldId = quint16(thisField >= 0 ? thisField : GATEWAY_FIRST_FIELD);
+		gateway.destinationX = gateway.destinationY = 0x7FFF; // the centre of the triangle
+		gateway.destinationTriangle = 0;
+	}
+
+	gateway.exitLine[0] = a;
+	gateway.exitLine[1] = b;
+	inf->setGateway(slot, gateway);
+	pushGatewaysEdit(tr("Add exit"), before);
+	gateList->setCurrentRow(slot);
+}
+
+void WalkmeshWidget::deleteExit(int gate)
+{
+	InfFile *inf = data()->getInfFile();
+	const QList<Gateway> before = inf->getGateways();
+	Gateway gateway = before.at(gate);
+
+	// The game skips an exit by its field id alone; the rest is kept, so undoing is not needed
+	// to get it back: typing the field id again is enough
+	gateway.fieldId = GATEWAY_UNUSED;
+	inf->setGateway(gate, gateway);
+	pushGatewaysEdit(tr("Disable exit"), before);
+}
+
+void WalkmeshWidget::startArrivalPick()
+{
+	gatewaysBefore = data()->getInfFile()->getGateways();
+}
+
+void WalkmeshWidget::pickArrival(qint16 x, qint16 y, int triangle)
+{
+	const int gate = gateList->currentRow();
+	Gateway gateway = data()->getInfFile()->getGateway(gate);
+
+	gateway.destinationX = x;
+	gateway.destinationY = y;
+	gateway.destinationTriangle = qint16(triangle);
+	data()->getInfFile()->setGateway(gate, gateway);
+
+	QSignalBlocker b0(destinationX), b1(destinationY), b2(destinationTriangle);
+	destinationX->setValue(x);
+	destinationY->setValue(y);
+	destinationTriangle->setValue(triangle);
+
+	walkmeshGL->setArrival(x, y, triangle);
+}
+
+void WalkmeshWidget::finishArrivalPick()
+{
+	pushGatewaysEdit(tr("Move arrival"), gatewaysBefore);
+}
+
+void WalkmeshWidget::applyGatewayEdit(const QString &text, const std::function<void(Gateway &)> &edit)
+{
+	const int gateId = gateList->currentRow();
+
+	if (!hasData() || !data()->hasInfFile() || gateId < 0 || gateId >= 12) {
+		return;
+	}
+
+	const QList<Gateway> before = data()->getInfFile()->getGateways();
+	Gateway gateway = before.at(gateId);
+	edit(gateway);
+
+	if (InfFile::sameGateway(gateway, before.at(gateId))) {
+		return;
+	}
+
+	data()->getInfFile()->setGateway(gateId, gateway);
+	pushGatewaysEdit(text, before);
+}
+
+void WalkmeshWidget::pushGatewaysEdit(const QString &text, const QList<Gateway> &before)
+{
+	const QList<Gateway> after = data()->getInfFile()->getGateways();
+	bool changed = false;
+
+	for (int i = 0; i < after.size(); ++i) {
+		changed = changed || !InfFile::sameGateway(after.at(i), before.at(i));
+	}
+
+	if (changed) {
+		undoStack->push(new GatewaysEditCommand(this, text, before, after)); // push() applies it
 	}
 }
 
-void WalkmeshWidget::editEntryPoint(const Vertex &values)
+void WalkmeshWidget::restoreGateways(const QList<Gateway> &gateways)
 {
-	if (data()->hasInfFile()) {
-		int gateId = gateList->currentRow();
-		Gateway old = data()->getInfFile()->getGateway(gateId);
-		Vertex oldVertex = old.destinationPoint;
-		if (oldVertex.x != values.x || oldVertex.y != values.y || oldVertex.z != values.z) {
-			old.destinationPoint = values;
-			data()->getInfFile()->setGateway(gateId, old);
-			emit modified();
-		}
+	if (!hasData() || !data()->hasInfFile()) {
+		return;
 	}
+
+	data()->getInfFile()->setGateways(gateways);
+	fillGatewayList();
+	setCurrentGateway(qMax(0, gateList->currentRow())); // refreshes the form and the destination
+	walkmeshGL->update();
+	emit modified();
 }
 
 void WalkmeshWidget::editDoorPoint(const Vertex &values)
@@ -1173,48 +1564,23 @@ void WalkmeshWidget::editUnknownGate(int val)
 
 void WalkmeshWidget::editUnknownGate(int id, int val)
 {
-	if (data()->hasInfFile()) {
-		int gateId = gateList->currentRow();
-		Gateway old = data()->getInfFile()->getGateway(gateId);
-		if (old.unknown1[id] != val) {
-			old.unknown1[id] = val;
-			data()->getInfFile()->setGateway(gateId, old);
-			emit modified();
-		}
-	}
+	applyGatewayEdit(tr("Edit exit"), [&](Gateway &gateway) {
+		gateway.unknown1[id] = quint16(val);
+	});
 }
 
 void WalkmeshWidget::editUnknownGate(const QByteArray &u)
 {
-	if (data()->hasInfFile()) {
-		int gateId = gateList->currentRow();
-		const char *uData = u.constData();
-		Gateway old = data()->getInfFile()->getGateway(gateId);
-		memcpy(&old.unknown2, uData, 4);
-		if (old.unknown2 != data()->getInfFile()->getGateway(gateId).unknown2) {
-			data()->getInfFile()->setGateway(gateId, old);
-			emit modified();
-		}
-	}
+	applyGatewayEdit(tr("Edit exit"), [&](Gateway &gateway) {
+		memcpy(gateway.unknown2, u.leftJustified(3, '\0', true).constData(), 3);
+	});
 }
 
 void WalkmeshWidget::editFieldId(int v)
 {
-	if (data()->hasInfFile()) {
-		int gateId = gateList->currentRow();
-		Gateway old = data()->getInfFile()->getGateway(gateId);
-		if (old.fieldId != v) {
-			old.fieldId = v;
-			data()->getInfFile()->setGateway(gateId, old);
-			if (v != 0x7FFF) {
-				gateList->currentItem()->setText(QString("%1 (%2)").arg(Data::maplist().value(v)).arg(v));
-			} else {
-				gateList->currentItem()->setText(tr("Unused"));
-			}
-
-			emit modified();
-		}
-	}
+	applyGatewayEdit(tr("Change exit destination"), [&](Gateway &gateway) {
+		gateway.fieldId = quint16(v);
+	});
 }
 
 void WalkmeshWidget::editDoorUsed(bool enable)

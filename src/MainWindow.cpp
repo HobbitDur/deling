@@ -371,6 +371,7 @@ bool MainWindow::openArchive(const QString &path)
 
 		((CharaWidget *)pageWidgets.at(ModelPage))->setFieldArchive(fieldArchive);
 		((JsmWidget *)pageWidgets.at(ScriptPage))->setFieldArchive(fieldArchive);
+		((WalkmeshWidget *)pageWidgets.at(WalkmeshPage))->setFieldArchive(fieldArchive);
 
 		QString previousSessionField = Config::value("currentField").toString();
 		if (!previousSessionField.isEmpty()) {
@@ -432,6 +433,7 @@ bool MainWindow::openFsArchive(const QString &path)
 			fieldArchive = nullptr;
 			((CharaWidget *)pageWidgets.at(ModelPage))->setFieldArchive(nullptr);
 			((JsmWidget *)pageWidgets.at(ScriptPage))->setFieldArchive(nullptr);
+			((WalkmeshWidget *)pageWidgets.at(WalkmeshPage))->setFieldArchive(nullptr);
 			searchDialog->setFieldArchive(nullptr);
 			searchAllDialog->setFieldArchive(nullptr);
 			if (_varManager != nullptr)		_varManager->setFieldArchive(nullptr);
@@ -619,6 +621,7 @@ int MainWindow::closeFiles(bool quit)
 	}
 	((CharaWidget *)pageWidgets.at(ModelPage))->setFieldArchive(nullptr);
 	((JsmWidget *)pageWidgets.at(ScriptPage))->setFieldArchive(fieldArchive);
+	((WalkmeshWidget *)pageWidgets.at(WalkmeshPage))->setFieldArchive(nullptr);
 	currentPath->setText(QString());
 	setReadOnly(true);
 

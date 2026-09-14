@@ -19,10 +19,35 @@
 #include <cmath>
 #include <limits>
 
+// Each colour always means the same thing, whatever the tab
+static const QRgb COLOR_SIDE = 0xFFFFFFFF;     // side between two triangles
+static const QRgb COLOR_WALL = 0xFF6699CC;     // side with nothing across it
+static const QRgb COLOR_BROKEN = 0xFFFF2020;   // triangle the game cannot use
+static const QRgb COLOR_EXIT = 0xFFFF40FF;     // exit line
+static const QRgb COLOR_DOOR = 0xFF00FF00;     // door trigger line
+static const QRgb COLOR_SCRIPT = 0xFFFF00FF;   // line of a script (drawn instead of exits and doors)
+static const QRgb COLOR_SELECTED = 0xFFFF9000; // what the form shows
+static const QRgb COLOR_HOVER = 0xFFFFE040;    // what a click would grab or add
+
 // Walkmesh coordinates are drawn divided by 4096
 static QVector3D toScene(const Vertex_sr &point)
 {
 	return QVector3D(point.x / 4096.0f, point.y / 4096.0f, point.z / 4096.0f);
+}
+
+static QVector3D toScene(const Vertex &point)
+{
+	return QVector3D(point.x / 4096.0f, point.y / 4096.0f, point.z / 4096.0f);
+}
+
+static qint16 toCoordinate(float sceneValue)
+{
+	return qint16(qBound(-32768.0f, std::round(sceneValue * 4096.0f), 32767.0f));
+}
+
+static bool isUsed(const Gateway &gate)
+{
+	return gate.fieldId != GATEWAY_UNUSED;
 }
 
 static qreal distanceToSegment(const QPointF &p, const QPointF &a, const QPointF &b)
@@ -41,7 +66,8 @@ WalkmeshGLWidget::WalkmeshGLWidget(QWidget *parent)
       camID(0), _selectedTriangle(-1), _selectedDoor(-1), _selectedGate(-1),
       _lineToDrawPoint1(Vertex()), _lineToDrawPoint2(Vertex()),
       fovy(70.0), data(nullptr), curFrame(0), gpuRenderer(nullptr), _drawLine(false),
-      _backgroundVisible(true), _editable(false), _dragging(false), _panning(false)
+      _backgroundVisible(true), _editMode(NoEdit), _dragging(false), _panning(false), _pickingArrival(false),
+      _arrivalX(0), _arrivalY(0), _arrivalTriangle(-1)
 {
 	// setMouseTracking(true);
 	// startTimer(100);
@@ -82,15 +108,24 @@ void WalkmeshGLWidget::fill(Field *data)
 	resetCamera();
 }
 
-void WalkmeshGLWidget::setEditable(bool editable)
+void WalkmeshGLWidget::setEditMode(EditMode mode)
 {
-	_editable = editable;
-	// Highlighting the point under the mouse needs move events with no button held
-	setMouseTracking(editable);
-
-	if (!editable) {
-		clearPointSelection();
+	if (mode == _editMode) {
+		return;
 	}
+
+	_editMode = mode;
+	// Highlighting what is under the mouse needs move events with no button held
+	setMouseTracking(mode != NoEdit);
+	clearPointSelection();
+}
+
+void WalkmeshGLWidget::setArrival(qint16 x, qint16 y, int triangle)
+{
+	_arrivalX = x;
+	_arrivalY = y;
+	_arrivalTriangle = triangle;
+	update();
 }
 
 void WalkmeshGLWidget::clearPointSelection()
@@ -99,7 +134,13 @@ void WalkmeshGLWidget::clearPointSelection()
 	_selectedPoint.reset();
 	_draggedPoint.reset();
 	_sidePreview.reset();
+	_hoveredExitEnd.reset();
+	_draggedExitEnd.reset();
+	_hoveredExit.reset();
+	_exitPreview.reset();
+	_hoveredFloor.reset();
 	_dragging = false;
+	_pickingArrival = false;
 	update();
 }
 
@@ -177,138 +218,225 @@ void WalkmeshGLWidget::paintGL()
 	gpuRenderer->bindViewMatrix(viewMatrix());
 
 	if (data->hasIdFile()) {
-		IdFile *idFile = data->getIdFile();
-		int i=0;
+		drawWalkmesh();
+	}
 
-		for (const Triangle &triangle: idFile->getTriangles()) {
-			const Access &access = idFile->access(i);
-			// Red: a triangle the game cannot use - flipped (never walked on), flat (drops the
-			// player to height 0) or past the last id the script can lock
-			const bool broken = IdFile::isFlipped(triangle) || IdFile::isFlat(triangle)
-			                    || i >= IdFile::MAX_TRIANGLES;
+	const QVector2D texcoord;
 
-			for (int side = 0; side < 3; ++side) {
-				QRgb color = i == _selectedTriangle ? 0xFFFF9000
-				             : broken ? 0xFFFF2020
-				             : access.a[side] == -1 ? 0xFF6699CC : 0xFFFFFFFF;
-				bufferLine(triangle.vertices[side], triangle.vertices[(side + 1) % 3], QRgba64::fromArgb32(color));
-			}
+	if (_drawLine) {
+		// A script line is shown on its own, without the exits and doors
+		gpuRenderer->bufferVertex(toScene(_lineToDrawPoint1), QRgba64::fromArgb32(COLOR_SCRIPT), texcoord);
+		gpuRenderer->bufferVertex(toScene(_lineToDrawPoint2), QRgba64::fromArgb32(COLOR_SCRIPT), texcoord);
+		gpuRenderer->draw(RendererPrimitiveType::PT_LINES);
+	} else if (data->hasInfFile()) {
+		drawExitsAndDoors();
+	}
 
-			++i;
+	if (_editMode == PickArrival && data->hasIdFile()) {
+		drawArrival();
+	}
+}
+
+void WalkmeshGLWidget::drawWalkmesh()
+{
+	IdFile *idFile = data->getIdFile();
+	const QVector2D texcoord;
+	// The selected triangle is noise while exits are edited, and belongs to another field while
+	// an exit's destination is shown
+	const bool showSelectedTriangle = _editMode == NoEdit || _editMode == EditWalkmesh;
+	const bool hasSelectedTriangle = showSelectedTriangle && _selectedTriangle >= 0
+	                                 && _selectedTriangle < idFile->triangleCount();
+
+	for (int i = 0; i < idFile->triangleCount(); ++i) {
+		const Triangle &triangle = idFile->triangle(i);
+		const Access &access = idFile->access(i);
+		// A triangle the game cannot use: flipped (never walked on), flat (drops the player to
+		// height 0) or past the last id the script can lock
+		const bool broken = IdFile::isFlipped(triangle) || IdFile::isFlat(triangle)
+		                    || i >= IdFile::MAX_TRIANGLES;
+
+		for (int side = 0; side < 3; ++side) {
+			QRgb color = hasSelectedTriangle && i == _selectedTriangle ? COLOR_SELECTED
+			             : broken ? COLOR_BROKEN
+			             : access.a[side] == -1 ? COLOR_WALL : COLOR_SIDE;
+			bufferLine(triangle.vertices[side], triangle.vertices[(side + 1) % 3], QRgba64::fromArgb32(color));
+		}
+	}
+
+	// The triangle a click would add, dashed until it exists
+	if (_sidePreview) {
+		const Triangle &source = idFile->triangle(_sidePreview->triangleID);
+		const QRgba64 color = QRgba64::fromArgb32(COLOR_HOVER);
+		bufferLine(source.vertices[_sidePreview->side], _sidePreview->point, color, true);
+		bufferLine(source.vertices[(_sidePreview->side + 1) % 3], _sidePreview->point, color, true);
+	}
+
+	gpuRenderer->draw(RendererPrimitiveType::PT_LINES);
+
+	if (hasSelectedTriangle) {
+		for (const Vertex_sr &vertex: idFile->triangle(_selectedTriangle).vertices) {
+			gpuRenderer->bufferVertex(toScene(vertex), QRgba64::fromArgb32(COLOR_SELECTED), texcoord);
+		}
+	}
+
+	gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 7.0f);
+
+	// The selected point, and what a click would grab or add - or where a dragged exit end snaps
+	if (_selectedPoint) {
+		gpuRenderer->bufferVertex(toScene(*_selectedPoint), QRgba64::fromArgb32(COLOR_SELECTED), texcoord);
+	}
+	if (_hoveredPoint) {
+		gpuRenderer->bufferVertex(toScene(*_hoveredPoint), QRgba64::fromArgb32(COLOR_HOVER), texcoord);
+	}
+	if (_sidePreview) {
+		gpuRenderer->bufferVertex(toScene(_sidePreview->point), QRgba64::fromArgb32(COLOR_HOVER), texcoord);
+	}
+
+	gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 11.0f);
+}
+
+void WalkmeshGLWidget::drawExitsAndDoors()
+{
+	InfFile *inf = data->getInfFile();
+	const QVector2D texcoord;
+	const bool editingExits = _editMode == EditExits;
+
+	// Exits are drawn thick, with points all along them: lines are one pixel wide, and an exit
+	// has to stand out from the walls it usually runs along
+	const QMatrix4x4 mvp = sceneToClip();
+
+	for (int gateID = 0; gateID < 12; ++gateID) {
+		const Gateway &gate = inf->getGateway(gateID);
+		QPointF a, b;
+
+		if (!isUsed(gate)) {
+			continue;
 		}
 
-		// The triangle a click would add, dashed until it exists
-		if (_sidePreview) {
-			const Triangle &source = idFile->triangle(_sidePreview->triangleID);
-			const QRgba64 color = QRgba64::fromArgb32(0xFFFFE040);
-			bufferLine(source.vertices[_sidePreview->side], _sidePreview->point, color, true);
-			bufferLine(source.vertices[(_sidePreview->side + 1) % 3], _sidePreview->point, color, true);
+		const bool hovered = _hoveredExit == gateID || (_hoveredExitEnd && _hoveredExitEnd->gate == gateID);
+		const QRgba64 color = QRgba64::fromArgb32(editingExits && hovered ? COLOR_HOVER
+		                                          : editingExits && gateID == _selectedGate ? COLOR_SELECTED
+		                                          : COLOR_EXIT);
+		const QVector3D from = toScene(gate.exitLine[0]), to = toScene(gate.exitLine[1]);
+		const bool onScreen = toScreen(mvp, IdFile::fromVertex_s(gate.exitLine[0]), a)
+		                      && toScreen(mvp, IdFile::fromVertex_s(gate.exitLine[1]), b);
+		// A point every 2 pixels, and a sensible number when an end is behind the camera
+		const int steps = onScreen ? qBound(1, int(QLineF(a, b).length() / 2.0), 2000) : 200;
+
+		for (int step = 0; step <= steps; ++step) {
+			gpuRenderer->bufferVertex(from + (to - from) * (float(step) / steps), color, texcoord);
 		}
+	}
 
-		if (!_drawLine && data->hasInfFile()) {
-			InfFile *inf = data->getInfFile();
+	gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 4.0f);
 
-			for (const Gateway &gate: inf->getGateways()) {
-				if (gate.fieldId != 0x7FFF) {
-					// Vertex info
-					QVector3D positionA(gate.exitLine[0].x / 4096.0, gate.exitLine[0].y / 4096.0, gate.exitLine[0].z / 4096.0),
-										positionB(gate.exitLine[1].x / 4096.0, gate.exitLine[1].y / 4096.0, gate.exitLine[1].z / 4096.0);
-					QRgba64   color = QRgba64::fromArgb32(0xFFFF0000);
-					QVector2D texcoord;
+	for (const Trigger &trigger: inf->getTriggers()) {
+		gpuRenderer->bufferVertex(toScene(trigger.trigger_line[0]), QRgba64::fromArgb32(COLOR_DOOR), texcoord);
+		gpuRenderer->bufferVertex(toScene(trigger.trigger_line[1]), QRgba64::fromArgb32(COLOR_DOOR), texcoord);
+	}
 
-					gpuRenderer->bufferVertex(positionA, color, texcoord);
-					gpuRenderer->bufferVertex(positionB, color, texcoord);
-				}
-			}
+	// The exit a click would add, along a wall
+	if (_exitPreview) {
+		bufferLine(_exitPreview->a, _exitPreview->b, QRgba64::fromArgb32(COLOR_HOVER), true);
+	}
 
-			for (const Trigger &trigger: inf->getTriggers()) {
-				if (trigger.doorID != 0xFF) {
-					// Vertex info
-					QVector3D positionA(trigger.trigger_line[0].x / 4096.0, trigger.trigger_line[0].y / 4096.0, trigger.trigger_line[0].z / 4096.0),
-										positionB(trigger.trigger_line[1].x / 4096.0, trigger.trigger_line[1].y / 4096.0, trigger.trigger_line[1].z / 4096.0);
-					QRgba64   color = QRgba64::fromArgb32(0xFF00FF00);
-					QVector2D texcoord;
+	gpuRenderer->draw(RendererPrimitiveType::PT_LINES);
 
-					gpuRenderer->bufferVertex(positionA, color, texcoord);
-					gpuRenderer->bufferVertex(positionB, color, texcoord);
-				}
-			}
+	// Exit ends, so they can be seen and grabbed
+	for (int gateID = 0; gateID < 12; ++gateID) {
+		const Gateway &gate = inf->getGateway(gateID);
+
+		if (isUsed(gate) && (editingExits || gateID == _selectedGate)) {
+			gpuRenderer->bufferVertex(toScene(gate.exitLine[0]), QRgba64::fromArgb32(COLOR_EXIT), texcoord);
+			gpuRenderer->bufferVertex(toScene(gate.exitLine[1]), QRgba64::fromArgb32(COLOR_EXIT), texcoord);
 		}
+	}
 
-		if (_drawLine) {
-			// Vertex info
-			QVector3D positionA(_lineToDrawPoint1.x / 4096.0, _lineToDrawPoint1.y / 4096.0, _lineToDrawPoint1.z / 4096.0),
-								positionB(_lineToDrawPoint2.x / 4096.0, _lineToDrawPoint2.y / 4096.0, _lineToDrawPoint2.z / 4096.0);
-			QRgba64   color = QRgba64::fromArgb32(0xFFFF00FF);
-			QVector2D texcoord;
-
-			gpuRenderer->bufferVertex(positionA, color, texcoord);
-			gpuRenderer->bufferVertex(positionB, color, texcoord);
+	if (_selectedDoor >= 0 && _selectedDoor < 12) {
+		const Trigger &trigger = inf->getTrigger(_selectedDoor);
+		if (trigger.doorID != 0xFF) {
+			gpuRenderer->bufferVertex(toScene(trigger.trigger_line[0]), QRgba64::fromArgb32(COLOR_DOOR), texcoord);
+			gpuRenderer->bufferVertex(toScene(trigger.trigger_line[1]), QRgba64::fromArgb32(COLOR_DOOR), texcoord);
 		}
+	}
 
+	gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 7.0f);
+
+	if (editingExits) {
+		if (_selectedGate >= 0 && _selectedGate < 12 && isUsed(inf->getGateway(_selectedGate))) {
+			const Gateway &gate = inf->getGateway(_selectedGate);
+			gpuRenderer->bufferVertex(toScene(gate.exitLine[0]), QRgba64::fromArgb32(COLOR_SELECTED), texcoord);
+			gpuRenderer->bufferVertex(toScene(gate.exitLine[1]), QRgba64::fromArgb32(COLOR_SELECTED), texcoord);
+		}
+		if (_hoveredExitEnd) {
+			const Vertex &end = inf->getGateway(_hoveredExitEnd->gate).exitLine[_hoveredExitEnd->end];
+			gpuRenderer->bufferVertex(toScene(end), QRgba64::fromArgb32(COLOR_HOVER), texcoord);
+		}
+	}
+
+	gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 11.0f);
+}
+
+// Where an exit arrives, shown over its destination field
+void WalkmeshGLWidget::drawArrival()
+{
+	IdFile *idFile = data->getIdFile();
+	const QVector2D texcoord;
+	const QRgba64 selected = QRgba64::fromArgb32(COLOR_SELECTED);
+
+	if (_arrivalTriangle >= 0 && _arrivalTriangle < idFile->triangleCount()) {
+		const Triangle &triangle = idFile->triangle(_arrivalTriangle);
+
+		for (int side = 0; side < 3; ++side) {
+			bufferLine(triangle.vertices[side], triangle.vertices[(side + 1) % 3], selected);
+		}
 		gpuRenderer->draw(RendererPrimitiveType::PT_LINES);
 
-		if (_selectedTriangle >= 0 && _selectedTriangle < data->getIdFile()->triangleCount()) {
-			const Triangle &triangle = data->getIdFile()->triangle(_selectedTriangle);
-
-			// Vertex info
-			QVector3D positionA(triangle.vertices[0].x / 4096.0, triangle.vertices[0].y / 4096.0, triangle.vertices[0].z / 4096.0),
-								positionB(triangle.vertices[1].x / 4096.0, triangle.vertices[1].y / 4096.0, triangle.vertices[1].z / 4096.0),
-								positionC(triangle.vertices[2].x / 4096.0, triangle.vertices[2].y / 4096.0, triangle.vertices[2].z / 4096.0);
-			QRgba64   color = QRgba64::fromArgb32(0xFFFF9000);
-			QVector2D texcoord;
-
-			// Line
-			gpuRenderer->bufferVertex(positionA, color, texcoord);
-			gpuRenderer->bufferVertex(positionB, color, texcoord);
-			gpuRenderer->bufferVertex(positionC, color, texcoord);
-		}
-
-		if (data->hasInfFile()) {
-			if (_selectedGate >= 0 && _selectedGate < 12) {
-				const Gateway &gate = data->getInfFile()->getGateway(_selectedGate);
-				if (gate.fieldId != 0x7FFF) {
-					// Vertex info
-					QVector3D positionA(gate.exitLine[0].x / 4096.0, gate.exitLine[0].y / 4096.0, gate.exitLine[0].z / 4096.0),
-										positionB(gate.exitLine[1].x / 4096.0, gate.exitLine[1].y / 4096.0, gate.exitLine[1].z / 4096.0);
-					QRgba64   color = QRgba64::fromArgb32(0xFFFF0000);
-					QVector2D texcoord;
-
-					gpuRenderer->bufferVertex(positionA, color, texcoord);
-					gpuRenderer->bufferVertex(positionB, color, texcoord);
-				}
-			}
-
-			if (_selectedDoor >= 0 && _selectedDoor < 12) {
-				const Trigger &trigger = data->getInfFile()->getTrigger(_selectedDoor);
-				if (trigger.doorID != 0xFF) {
-					// Vertex info
-					QVector3D positionA(trigger.trigger_line[0].x / 4096.0, trigger.trigger_line[0].y / 4096.0, trigger.trigger_line[0].z / 4096.0),
-										positionB(trigger.trigger_line[1].x / 4096.0, trigger.trigger_line[1].y / 4096.0, trigger.trigger_line[1].z / 4096.0);
-					QRgba64   color = QRgba64::fromArgb32(0xFF00FF00);
-					QVector2D texcoord;
-
-					gpuRenderer->bufferVertex(positionA, color, texcoord);
-					gpuRenderer->bufferVertex(positionB, color, texcoord);
-				}
-			}
-		}
-
-		gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 7.0f);
-
-		// The selected point (orange), and what a click would grab or add (yellow)
-		const QVector2D texcoord;
-		if (_selectedPoint) {
-			gpuRenderer->bufferVertex(toScene(*_selectedPoint), QRgba64::fromArgb32(0xFFFF9000), texcoord);
-		}
-		if (_hoveredPoint) {
-			gpuRenderer->bufferVertex(toScene(*_hoveredPoint), QRgba64::fromArgb32(0xFFFFE040), texcoord);
-		}
-		if (_sidePreview) {
-			gpuRenderer->bufferVertex(toScene(_sidePreview->point), QRgba64::fromArgb32(0xFFFFE040), texcoord);
-		}
-		gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 11.0f);
+		gpuRenderer->bufferVertex(toScene(arrivalPoint()), selected, texcoord);
 	}
+
+	if (_hoveredFloor) {
+		gpuRenderer->bufferVertex(toScene(_hoveredFloor->point), QRgba64::fromArgb32(COLOR_HOVER), texcoord);
+	}
+
+	gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 13.0f);
+}
+
+/**
+ * The height of a triangle's plane at (x, y). Field_Walkmesh_PlaceEntitiesOnLoad computes the
+ * arrival height the same way, from the triangle alone.
+ */
+static float heightOnTriangle(const Triangle &triangle, float x, float y)
+{
+	const QVector3D a(triangle.vertices[0].x, triangle.vertices[0].y, triangle.vertices[0].z),
+	                b(triangle.vertices[1].x, triangle.vertices[1].y, triangle.vertices[1].z),
+	                c(triangle.vertices[2].x, triangle.vertices[2].y, triangle.vertices[2].z);
+	const QVector3D normal = QVector3D::crossProduct(b - a, c - a);
+
+	if (qFuzzyIsNull(normal.z())) {
+		return a.z(); // a flat triangle has no height to give
+	}
+
+	return a.z() - (normal.x() * (x - a.x()) + normal.y() * (y - a.y())) / normal.z();
+}
+
+Vertex_sr WalkmeshGLWidget::arrivalPoint() const
+{
+	const Triangle &triangle = data->getIdFile()->triangle(_arrivalTriangle);
+	Vertex_sr point = {};
+
+	if (_arrivalX == 0x7FFF) {
+		// The game puts the player at the centre of the triangle
+		point.x = qint16((triangle.vertices[0].x + triangle.vertices[1].x + triangle.vertices[2].x) / 3);
+		point.y = qint16((triangle.vertices[0].y + triangle.vertices[1].y + triangle.vertices[2].y) / 3);
+		point.z = qint16((triangle.vertices[0].z + triangle.vertices[1].z + triangle.vertices[2].z) / 3);
+	} else {
+		point.x = _arrivalX;
+		point.y = _arrivalY;
+		point.z = qint16(heightOnTriangle(triangle, _arrivalX, _arrivalY));
+	}
+
+	return point;
 }
 
 QMatrix4x4 WalkmeshGLWidget::projectionMatrix() const
@@ -415,7 +543,8 @@ bool WalkmeshGLWidget::toScreen(const QMatrix4x4 &sceneToClip, const Vertex_sr &
  * Where the mouse points on the horizontal plane at `planeHeight`: a point is dragged along the
  * floor at its own height, so it moves over the ground seen through the game camera.
  */
-bool WalkmeshGLWidget::mouseOnHeight(const QPoint &pos, qint16 planeHeight, Vertex_sr &point) const
+// The mouse ray in scene coordinates, from the near plane to the far plane
+bool WalkmeshGLWidget::mouseRay(const QPoint &pos, QVector3D &nearPoint, QVector3D &farPoint) const
 {
 	bool invertible = false;
 	const QMatrix4x4 clipToScene = sceneToClip().inverted(&invertible);
@@ -424,12 +553,22 @@ bool WalkmeshGLWidget::mouseOnHeight(const QPoint &pos, qint16 planeHeight, Vert
 		return false;
 	}
 
-	// The mouse ray, from the near plane to the far plane
 	const float ndcX = 2.0f * pos.x() / width() - 1.0f, ndcY = 1.0f - 2.0f * pos.y() / height();
 	const QVector4D nearClip = clipToScene * QVector4D(ndcX, ndcY, -1.0f, 1.0f),
 	                farClip = clipToScene * QVector4D(ndcX, ndcY, 1.0f, 1.0f);
-	const QVector3D nearPoint = nearClip.toVector3D() / nearClip.w(),
-	                farPoint = farClip.toVector3D() / farClip.w();
+	nearPoint = nearClip.toVector3D() / nearClip.w();
+	farPoint = farClip.toVector3D() / farClip.w();
+
+	return true;
+}
+
+bool WalkmeshGLWidget::mouseOnHeight(const QPoint &pos, qint16 planeHeight, Vertex_sr &point) const
+{
+	QVector3D nearPoint, farPoint;
+
+	if (!mouseRay(pos, nearPoint, farPoint)) {
+		return false;
+	}
 
 	const float planeZ = planeHeight / 4096.0f, dz = farPoint.z() - nearPoint.z();
 
@@ -439,12 +578,65 @@ bool WalkmeshGLWidget::mouseOnHeight(const QPoint &pos, qint16 planeHeight, Vert
 
 	const QVector3D hit = nearPoint + (farPoint - nearPoint) * ((planeZ - nearPoint.z()) / dz);
 
-	point.x = qint16(qBound(-32768.0f, std::round(hit.x() * 4096.0f), 32767.0f));
-	point.y = qint16(qBound(-32768.0f, std::round(hit.y() * 4096.0f), 32767.0f));
+	point.x = toCoordinate(hit.x());
+	point.y = toCoordinate(hit.y());
 	point.z = planeHeight;
 	point.res = 0;
 
 	return true;
+}
+
+/**
+ * The walkmesh point under the mouse: where the mouse ray meets the nearest triangle seen
+ * through it, and that triangle's id.
+ */
+std::optional<WalkmeshGLWidget::FloorPoint> WalkmeshGLWidget::floorAt(const QPoint &pos) const
+{
+	QVector3D nearPoint, farPoint;
+
+	if (!data || !data->hasIdFile() || !mouseRay(pos, nearPoint, farPoint)) {
+		return std::nullopt;
+	}
+
+	const QVector3D ray = farPoint - nearPoint;
+	std::optional<FloorPoint> nearest;
+	float nearestT = std::numeric_limits<float>::max();
+	IdFile *idFile = data->getIdFile();
+
+	for (int triangleID = 0; triangleID < idFile->triangleCount(); ++triangleID) {
+		const Triangle &triangle = idFile->triangle(triangleID);
+
+		if (IdFile::isFlat(triangle)) {
+			continue;
+		}
+
+		const QVector3D a = toScene(triangle.vertices[0]), b = toScene(triangle.vertices[1]), c = toScene(triangle.vertices[2]);
+		const QVector3D normal = QVector3D::crossProduct(b - a, c - a);
+		const float along = QVector3D::dotProduct(normal, ray);
+
+		if (qFuzzyIsNull(along)) {
+			continue; // looking along the triangle
+		}
+
+		const float t = QVector3D::dotProduct(normal, a - nearPoint) / along;
+		if (t < 0.0f || t > nearestT) {
+			continue;
+		}
+
+		// Inside when the hit is on the same side of the three sides, seen from above
+		const QVector3D hit = nearPoint + ray * t;
+		auto sideOf = [&hit](const QVector3D &from, const QVector3D &to) {
+			return (to.x() - from.x()) * (hit.y() - from.y()) - (to.y() - from.y()) * (hit.x() - from.x());
+		};
+		const float ab = sideOf(a, b), bc = sideOf(b, c), ca = sideOf(c, a);
+
+		if ((ab >= 0 && bc >= 0 && ca >= 0) || (ab <= 0 && bc <= 0 && ca <= 0)) {
+			nearestT = t;
+			nearest = FloorPoint{{toCoordinate(hit.x()), toCoordinate(hit.y()), toCoordinate(hit.z()), 0}, triangleID};
+		}
+	}
+
+	return nearest;
 }
 
 std::optional<Vertex_sr> WalkmeshGLWidget::pointAt(const QPoint &pos, const std::optional<Vertex_sr> &ignored) const
@@ -550,19 +742,141 @@ std::optional<WalkmeshGLWidget::SidePreview> WalkmeshGLWidget::sidePreviewAt(con
 	return SidePreview{nearestTriangle, nearestSide, point};
 }
 
+std::optional<WalkmeshGLWidget::ExitEnd> WalkmeshGLWidget::exitEndAt(const QPoint &pos) const
+{
+	if (!data || !data->hasInfFile()) {
+		return std::nullopt;
+	}
+
+	const QMatrix4x4 mvp = sceneToClip();
+	std::optional<ExitEnd> nearest;
+	qreal nearestDistance = PICK_RADIUS;
+
+	for (int gateID = 0; gateID < 12; ++gateID) {
+		const Gateway &gate = data->getInfFile()->getGateway(gateID);
+
+		for (int end = 0; end < 2 && isUsed(gate); ++end) {
+			QPointF screen;
+
+			if (toScreen(mvp, IdFile::fromVertex_s(gate.exitLine[end]), screen)
+			        && QLineF(screen, QPointF(pos)).length() <= nearestDistance) {
+				nearestDistance = QLineF(screen, QPointF(pos)).length();
+				nearest = ExitEnd{gateID, end};
+			}
+		}
+	}
+
+	return nearest;
+}
+
+std::optional<int> WalkmeshGLWidget::exitAt(const QPoint &pos) const
+{
+	if (!data || !data->hasInfFile()) {
+		return std::nullopt;
+	}
+
+	const QMatrix4x4 mvp = sceneToClip();
+	std::optional<int> nearest;
+	qreal nearestDistance = PICK_RADIUS;
+
+	for (int gateID = 0; gateID < 12; ++gateID) {
+		const Gateway &gate = data->getInfFile()->getGateway(gateID);
+		QPointF a, b;
+
+		if (isUsed(gate)
+		        && toScreen(mvp, IdFile::fromVertex_s(gate.exitLine[0]), a)
+		        && toScreen(mvp, IdFile::fromVertex_s(gate.exitLine[1]), b)
+		        && distanceToSegment(QPointF(pos), a, b) <= nearestDistance) {
+			nearestDistance = distanceToSegment(QPointF(pos), a, b);
+			nearest = gateID;
+		}
+	}
+
+	return nearest;
+}
+
+/**
+ * The exit a click would add: along the wall side nearest to the mouse. Only offered while one
+ * of the 12 exits of the file is unused, since the file cannot hold more.
+ */
+std::optional<WalkmeshGLWidget::ExitPreview> WalkmeshGLWidget::exitPreviewAt(const QPoint &pos) const
+{
+	if (!data || !data->hasInfFile() || !data->hasIdFile()) {
+		return std::nullopt;
+	}
+
+	bool hasUnusedExit = false;
+	for (const Gateway &gate: data->getInfFile()->getGateways()) {
+		hasUnusedExit = hasUnusedExit || !isUsed(gate);
+	}
+	if (!hasUnusedExit) {
+		return std::nullopt;
+	}
+
+	const QMatrix4x4 mvp = sceneToClip();
+	IdFile *idFile = data->getIdFile();
+	std::optional<ExitPreview> nearest;
+	qreal nearestDistance = PICK_RADIUS;
+
+	for (int triangleID = 0; triangleID < idFile->triangleCount(); ++triangleID) {
+		const Triangle &triangle = idFile->triangle(triangleID);
+
+		for (int side = 0; side < 3; ++side) {
+			const Vertex_sr &from = triangle.vertices[side], &to = triangle.vertices[(side + 1) % 3];
+			QPointF a, b;
+
+			if (idFile->access(triangleID).a[side] == -1
+			        && toScreen(mvp, from, a) && toScreen(mvp, to, b)
+			        && distanceToSegment(QPointF(pos), a, b) <= nearestDistance) {
+				nearestDistance = distanceToSegment(QPointF(pos), a, b);
+				nearest = ExitPreview{from, to};
+			}
+		}
+	}
+
+	return nearest;
+}
+
 void WalkmeshGLWidget::updateHover(const QPoint &pos)
 {
 	_hoveredPoint.reset();
 	_sidePreview.reset();
+	_hoveredExitEnd.reset();
+	_hoveredExit.reset();
+	_exitPreview.reset();
+	_hoveredFloor.reset();
 
-	if (_editable && data && data->hasIdFile()) {
-		_hoveredPoint = pointAt(pos);
+	if (!data) {
+		return;
+	}
 
-		// Grabbing a point wins, and adding is only offered off the floor, so clicking on the
-		// floor never creates a triangle by accident
-		if (!_hoveredPoint && !isOnFloor(pos)) {
-			_sidePreview = sidePreviewAt(pos);
+	switch (_editMode) {
+	case EditWalkmesh:
+		if (data->hasIdFile()) {
+			_hoveredPoint = pointAt(pos);
+
+			// Grabbing a point wins, and adding is only offered off the floor, so clicking on the
+			// floor never creates a triangle by accident
+			if (!_hoveredPoint && !isOnFloor(pos)) {
+				_sidePreview = sidePreviewAt(pos);
+			}
 		}
+		break;
+	case EditExits:
+		// Grabbing an end wins over selecting a line, which wins over adding an exit
+		_hoveredExitEnd = exitEndAt(pos);
+		if (!_hoveredExitEnd) {
+			_hoveredExit = exitAt(pos);
+		}
+		if (!_hoveredExitEnd && !_hoveredExit) {
+			_exitPreview = exitPreviewAt(pos);
+		}
+		break;
+	case PickArrival:
+		_hoveredFloor = floorAt(pos);
+		break;
+	case NoEdit:
+		break;
 	}
 
 	update();
@@ -644,26 +958,62 @@ void WalkmeshGLWidget::mousePressEvent(QMouseEvent *event)
 		moveStart = event->pos();
 		_panning = true;
 	}
-	else if (event->button() == Qt::LeftButton && _editable)
+	else if (event->button() == Qt::LeftButton)
 	{
 		updateHover(event->pos());
 
-		if (_hoveredPoint) {
-			_selectedPoint = _draggedPoint = _hoveredPoint;
-			_dragging = true;
-			emit pointSelected(*_selectedPoint);
-			emit pointDragStarted();
-		} else if (_sidePreview) {
-			const SidePreview preview = *_sidePreview;
-			_sidePreview.reset();
-			_selectedPoint = preview.point;
-			emit pointAddRequested(preview.triangleID, preview.side, preview.point);
-			emit pointSelected(preview.point);
-		} else {
-			_selectedPoint.reset();
+		switch (_editMode) {
+		case EditWalkmesh:
+			pressOnWalkmesh();
+			break;
+		case EditExits:
+			pressOnExits();
+			break;
+		case PickArrival:
+			if (_hoveredFloor) {
+				_pickingArrival = true;
+				emit arrivalPickStarted();
+				emit arrivalPicked(_hoveredFloor->point.x, _hoveredFloor->point.y, _hoveredFloor->triangle);
+			}
+			break;
+		case NoEdit:
+			break;
 		}
 
 		update();
+	}
+}
+
+void WalkmeshGLWidget::pressOnWalkmesh()
+{
+	if (_hoveredPoint) {
+		_selectedPoint = _draggedPoint = _hoveredPoint;
+		_dragging = true;
+		emit pointSelected(*_selectedPoint);
+		emit pointDragStarted();
+	} else if (_sidePreview) {
+		const SidePreview preview = *_sidePreview;
+		_sidePreview.reset();
+		_selectedPoint = preview.point;
+		emit pointAddRequested(preview.triangleID, preview.side, preview.point);
+		emit pointSelected(preview.point);
+	} else {
+		_selectedPoint.reset();
+	}
+}
+
+void WalkmeshGLWidget::pressOnExits()
+{
+	if (_hoveredExitEnd) {
+		_draggedExitEnd = _hoveredExitEnd;
+		emit exitSelected(_draggedExitEnd->gate);
+		emit exitDragStarted();
+	} else if (_hoveredExit) {
+		emit exitSelected(*_hoveredExit);
+	} else if (_exitPreview) {
+		const ExitPreview preview = *_exitPreview;
+		_exitPreview.reset();
+		emit exitAddRequested(IdFile::toVertex_s(preview.a), IdFile::toVertex_s(preview.b));
 	}
 }
 
@@ -688,6 +1038,24 @@ void WalkmeshGLWidget::mouseMoveEvent(QMouseEvent *event)
 		// by surprise in a dense part of the walkmesh
 		_hoveredPoint = pointAt(event->pos(), _draggedPoint);
 		update();
+	} else if (_draggedExitEnd && (event->buttons() & Qt::LeftButton)) {
+		const Vertex &end = data->getInfFile()->getGateway(_draggedExitEnd->gate).exitLine[_draggedExitEnd->end];
+		Vertex_sr target;
+
+		// An exit end moves at its own height, like a walkmesh point
+		if (mouseOnHeight(event->pos(), end.z, target)) {
+			emit exitEndDragged(_draggedExitEnd->gate, _draggedExitEnd->end, IdFile::toVertex_s(target));
+		}
+
+		// The walkmesh point it would snap to on release
+		_hoveredPoint = pointAt(event->pos());
+		update();
+	} else if (_pickingArrival && (event->buttons() & Qt::LeftButton)) {
+		_hoveredFloor = floorAt(event->pos());
+		if (_hoveredFloor) {
+			emit arrivalPicked(_hoveredFloor->point.x, _hoveredFloor->point.y, _hoveredFloor->triangle);
+		}
+		update();
 	} else {
 		updateHover(event->pos());
 	}
@@ -709,6 +1077,20 @@ void WalkmeshGLWidget::mouseReleaseEvent(QMouseEvent *event)
 		_draggedPoint.reset();
 		emit pointDragFinished();
 		updateHover(event->pos());
+	} else if (event->button() == Qt::LeftButton && _draggedExitEnd) {
+		// Exits usually run along walls: dropped near a walkmesh point, the end goes exactly on it
+		const std::optional<Vertex_sr> target = pointAt(event->pos());
+		if (target) {
+			emit exitEndDragged(_draggedExitEnd->gate, _draggedExitEnd->end, IdFile::toVertex_s(*target));
+		}
+
+		_draggedExitEnd.reset();
+		emit exitDragFinished();
+		updateHover(event->pos());
+	} else if (event->button() == Qt::LeftButton && _pickingArrival) {
+		_pickingArrival = false;
+		emit arrivalPickFinished();
+		updateHover(event->pos());
 	}
 }
 
@@ -716,6 +1098,10 @@ void WalkmeshGLWidget::leaveEvent(QEvent *event)
 {
 	_hoveredPoint.reset();
 	_sidePreview.reset();
+	_hoveredExitEnd.reset();
+	_hoveredExit.reset();
+	_exitPreview.reset();
+	_hoveredFloor.reset();
 	update();
 	QOpenGLWidget::leaveEvent(event);
 }
@@ -733,10 +1119,13 @@ void WalkmeshGLWidget::keyPressEvent(QKeyEvent *event)
 		return;
 	}
 	if (event->key() == Qt::Key_Delete) {
-		if (_editable && _selectedPoint) {
+		if (_editMode == EditWalkmesh && _selectedPoint) {
 			const Vertex_sr point = *_selectedPoint;
 			clearPointSelection();
 			emit pointDeleteRequested(point);
+		} else if (_editMode == EditExits && _selectedGate >= 0 && _selectedGate < 12) {
+			clearPointSelection();
+			emit exitDeleteRequested(_selectedGate);
 		}
 		return;
 	}
