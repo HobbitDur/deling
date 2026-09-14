@@ -34,6 +34,13 @@ public:
 		PickArrival   // the view shows an exit's destination field: click its floor to place the arrival
 	};
 
+	// Where the field is looked at from
+	enum ViewMode {
+		GameView, // through the game camera, over the background
+		TopView,  // from straight above, without perspective
+		FreeView  // turning around the walkmesh with the right button
+	};
+
 	// Each colour always means the same thing, whatever the tab; WalkmeshWidget shows the legend
 	static constexpr QRgb COLOR_SIDE = 0xFFFFFFFF;     // side between two triangles
 	static constexpr QRgb COLOR_WALL = 0xFF6699CC;     // side with nothing across it
@@ -50,6 +57,10 @@ public:
 	void fill(Field *data);
 	void updatePerspective();
 	void setEditMode(EditMode mode);
+	void setViewMode(ViewMode mode);
+	inline ViewMode viewMode() const {
+		return _viewMode;
+	}
 	void setArrival(qint16 x, qint16 y, int triangle);
 	void clearPointSelection();
 signals:
@@ -73,9 +84,6 @@ signals:
 	void undoRequested();
 	void redoRequested();
 public slots:
-	void setXRotation(int);
-	void setYRotation(int);
-	void setZRotation(int);
 	void setZoom(int);
 	void resetCamera();
 	void setCurrentFieldCamera(int camID);
@@ -92,6 +100,13 @@ private:
 	static const int PICK_RADIUS = 10;
 	// How close to a wall, in pixels, the mouse has to be to add a triangle on it
 	static const int ADD_RADIUS = 60;
+	// Width in pixels of walls, broken and selected triangles and doors - and of exits
+	static constexpr float WIDE_LINE_WIDTH = 3.0f, EXIT_LINE_WIDTH = 6.0f;
+	// A corner of a wide line, already in screen coordinates
+	struct ScreenVertex {
+		QVector3D position;
+		QRgba64 color;
+	};
 	// The triangle a click would add while the mouse is off the floor: a border side and a point
 	struct SidePreview {
 		int triangleID;
@@ -115,13 +130,23 @@ private:
 	void screenLetterbox(float &sx, float &sy) const;
 	void computeFov();
 	void drawBackground();
+	void drawBackgroundOnFloor();
+	void bindSceneMatrices();
+	void bufferWideLine(const QMatrix4x4 &sceneToClip, const QVector3D &from, const QVector3D &to, QRgb color, float pixels);
+	void drawWideLines();
 	void drawWalkmesh();
 	void drawExitsAndDoors();
 	void drawArrival();
 	QMatrix4x4 projectionMatrix() const;
 	QMatrix4x4 viewMatrix() const;
+	QMatrix4x4 gameProjectionMatrix() const;
+	QMatrix4x4 gameViewMatrix() const;
 	QMatrix4x4 screenMatrix() const;
-	QMatrix4x4 modelMatrix() const;
+	QVector3D sceneCentre(float &radius) const;
+	float viewDistance(float radius) const;
+	bool gameCameraEye(QVector3D &eye) const;
+	float upSide() const;
+	void resetOrbit();
 	QMatrix4x4 sceneToClip() const;
 	bool toScreen(const QMatrix4x4 &sceneToClip, const Vertex_sr &point, QPointF &screen) const;
 	bool mouseRay(const QPoint &pos, QVector3D &nearPoint, QVector3D &farPoint) const;
@@ -142,7 +167,10 @@ private:
 	void bufferLine(const Vertex_sr &from, const Vertex_sr &to, QRgba64 color, bool dashed = false);
 	// Zoom and move of the view, in normalized device coordinates (the widget is -1..1)
 	float viewZoom, viewPanX, viewPanY;
-	float xRot, yRot, zRot;
+	ViewMode _viewMode;
+	// The free view camera: turned by orbitYaw around the vertical, orbitPitch degrees from it
+	float orbitYaw, orbitPitch;
+	QList<ScreenVertex> _wideLineVertices;
 	float transStep;
 	int lastKeyPressed;
 	int camID;
@@ -159,7 +187,7 @@ private:
 	bool _drawLine;
 	bool _backgroundVisible;
 	EditMode _editMode;
-	bool _dragging, _panning, _pickingArrival;
+	bool _dragging, _panning, _orbiting, _pickingArrival;
 	std::optional<Vertex_sr> _hoveredPoint, _selectedPoint, _draggedPoint;
 	std::optional<SidePreview> _sidePreview;
 	std::optional<ExitEnd> _hoveredExitEnd, _draggedExitEnd;

@@ -82,22 +82,17 @@ void WalkmeshWidget::build()
 {
 	if (isBuilded())		return;
 
-	slider1 = new QSlider(this);
-	slider2 = new QSlider(this);
-	slider3 = new QSlider(this);
+	viewMode = new QComboBox(this);
+	viewMode->addItem(tr("Game camera"), WalkmeshGLWidget::GameView);
+	viewMode->addItem(tr("Top view"), WalkmeshGLWidget::TopView);
+	viewMode->addItem(tr("Free 3D view"), WalkmeshGLWidget::FreeView);
+	viewMode->setToolTip(tr("The top and free views paint the background onto the walkmesh, "
+	                        "as the game camera sees it"));
 
-	slider1->setRange(-180, 180);
-	slider2->setRange(-180, 180);
-	slider3->setRange(-180, 180);
-
-	slider1->setValue(0);
-	slider2->setValue(0);
-	slider3->setValue(0);
-
-	QLabel *keyInfos = new QLabel(tr("Right-drag or the arrow keys move the view, the wheel zooms, "
-	                                 "a middle click resets it."));
-	keyInfos->setTextFormat(Qt::PlainText);
-	keyInfos->setWordWrap(true);
+	viewInfos = new QLabel(this);
+	viewInfos->setTextFormat(Qt::PlainText);
+	viewInfos->setWordWrap(true);
+	viewInfos->setMaximumWidth(260);
 
 	// What the colours of the view mean, with the very colours it uses
 	auto legendLine = [](QRgb color, const QString &meaning) {
@@ -134,10 +129,8 @@ void WalkmeshWidget::build()
 
 	QGridLayout *layout = new QGridLayout(this);
 	layout->addWidget(walkmeshGL, 0, 0, 5, 1);
-	layout->addWidget(slider1, 0, 1, Qt::AlignLeft);
-	layout->addWidget(slider2, 0, 2, Qt::AlignHCenter);
-	layout->addWidget(slider3, 0, 3, Qt::AlignRight);
-	layout->addWidget(keyInfos, 1, 1, 1, 3);
+	layout->addWidget(viewMode, 0, 1, 1, 3, Qt::AlignTop);
+	layout->addWidget(viewInfos, 1, 1, 1, 3);
 	layout->addWidget(resetCamera, 2, 1, 1, 3);
 	layout->addWidget(showBackground, 3, 1, 1, 3);
 	layout->addWidget(legend, 4, 1, 1, 3, Qt::AlignTop);
@@ -145,9 +138,8 @@ void WalkmeshWidget::build()
 	layout->setColumnStretch(0, 1);
 	layout->setContentsMargins(QMargins());
 
-	connect(slider1, SIGNAL(valueChanged(int)), walkmeshGL, SLOT(setXRotation(int)));
-	connect(slider2, SIGNAL(valueChanged(int)), walkmeshGL, SLOT(setYRotation(int)));
-	connect(slider3, SIGNAL(valueChanged(int)), walkmeshGL, SLOT(setZRotation(int)));
+	connect(viewMode, &QComboBox::currentIndexChanged, this, &WalkmeshWidget::changeViewMode);
+	changeViewMode();
 	connect(resetCamera, SIGNAL(clicked()), SLOT(resetCamera()));
 	connect(showBackground, SIGNAL(toggled(bool)), walkmeshGL, SLOT(setBackgroundVisible(bool)));
 
@@ -176,16 +168,29 @@ void WalkmeshWidget::build()
 
 void WalkmeshWidget::resetCamera()
 {
-	slider1->blockSignals(true);
-	slider2->blockSignals(true);
-	slider3->blockSignals(true);
-	slider1->setValue(0);
-	slider2->setValue(0);
-	slider3->setValue(0);
-	slider1->blockSignals(false);
-	slider2->blockSignals(false);
-	slider3->blockSignals(false);
 	walkmeshGL->resetCamera();
+}
+
+void WalkmeshWidget::changeViewMode()
+{
+	const auto mode = WalkmeshGLWidget::ViewMode(viewMode->currentData().toInt());
+
+	walkmeshGL->setViewMode(mode);
+
+	switch (mode) {
+	case WalkmeshGLWidget::GameView:
+		viewInfos->setText(tr("Right-drag or the arrow keys move the view, the wheel zooms, "
+		                      "a middle click resets it."));
+		break;
+	case WalkmeshGLWidget::TopView:
+		viewInfos->setText(tr("Seen from above, the far side of the game camera at the top. "
+		                      "Right-drag moves the view, the wheel zooms, a middle click resets it."));
+		break;
+	case WalkmeshGLWidget::FreeView:
+		viewInfos->setText(tr("Right-drag turns around the walkmesh, Shift+right-drag moves the view, "
+		                      "the wheel zooms, a middle click resets it."));
+		break;
+	}
 }
 
 QWidget *WalkmeshWidget::buildCameraPage()

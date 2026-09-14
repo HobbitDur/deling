@@ -40,6 +40,33 @@ static bool isUsed(const Gateway &gate)
 	return gate.fieldId != GATEWAY_UNUSED;
 }
 
+/**
+ * A triangle the game cannot use: flipped (never walked on), flat (drops the player to height 0)
+ * or past the last id the script can lock
+ */
+static bool isBroken(const Triangle &triangle, int triangleID)
+{
+	return IdFile::isFlipped(triangle) || IdFile::isFlat(triangle) || triangleID >= IdFile::MAX_TRIANGLES;
+}
+
+/**
+ * The triangles the top and free views are framed on: the ones the game can use. Broken
+ * triangles are left out, as some reach far away from the floor (glpreo2) and would leave it tiny.
+ */
+static QList<const Triangle *> framedTriangles(IdFile *idFile)
+{
+	QList<const Triangle *> usable, all;
+
+	for (int i = 0; i < idFile->triangleCount(); ++i) {
+		all.append(&idFile->triangle(i));
+		if (!isBroken(idFile->triangle(i), i)) {
+			usable.append(&idFile->triangle(i));
+		}
+	}
+
+	return usable.isEmpty() ? all : usable;
+}
+
 static qreal distanceToSegment(const QPointF &p, const QPointF &a, const QPointF &b)
 {
 	const QPointF ab = b - a;
@@ -51,12 +78,12 @@ static qreal distanceToSegment(const QPointF &p, const QPointF &a, const QPointF
 
 WalkmeshGLWidget::WalkmeshGLWidget(QWidget *parent)
     : QOpenGLWidget(parent),
-      viewZoom(1.0f), viewPanX(0.0f), viewPanY(0.0f), xRot(0.0f), yRot(0.0f), zRot(0.0f),
+      viewZoom(1.0f), viewPanX(0.0f), viewPanY(0.0f), _viewMode(GameView), orbitYaw(0.0f), orbitPitch(45.0f),
       transStep(360.0f), lastKeyPressed(-1),
       camID(0), _selectedTriangle(-1), _selectedDoor(-1), _selectedGate(-1),
       _lineToDrawPoint1(Vertex()), _lineToDrawPoint2(Vertex()),
       fovy(70.0), data(nullptr), curFrame(0), gpuRenderer(nullptr), _drawLine(false),
-      _backgroundVisible(true), _editMode(NoEdit), _dragging(false), _panning(false), _pickingArrival(false),
+      _backgroundVisible(true), _editMode(NoEdit), _dragging(false), _panning(false), _orbiting(false), _pickingArrival(false),
       _arrivalX(0), _arrivalY(0), _arrivalTriangle(-1)
 {
 	// setMouseTracking(true);
@@ -197,15 +224,23 @@ void WalkmeshGLWidget::paintGL()
 		return;
 	}
 
-	gpuRenderer->clear();
-
-	if (_backgroundVisible) {
-		drawBackground();
+	// The top and free views have no picture behind the walkmesh: a dark ground shows every line
+	if (_viewMode == GameView) {
+		gpuRenderer->clear();
+	} else {
+		gpuRenderer->clear(0.12f, 0.12f, 0.12f, 1.0f);
 	}
 
-	gpuRenderer->bindProjectionMatrix(projectionMatrix());
-	gpuRenderer->bindModelMatrix(modelMatrix());
-	gpuRenderer->bindViewMatrix(viewMatrix());
+	bindSceneMatrices();
+
+	if (_backgroundVisible && !tex.isNull()) {
+		if (_viewMode == GameView) {
+			drawBackground();
+		} else if (data->hasIdFile()) {
+			drawBackgroundOnFloor();
+		}
+		bindSceneMatrices();
+	}
 
 	if (data->hasIdFile()) {
 		drawWalkmesh();
@@ -227,10 +262,18 @@ void WalkmeshGLWidget::paintGL()
 	}
 }
 
+void WalkmeshGLWidget::bindSceneMatrices()
+{
+	gpuRenderer->bindProjectionMatrix(projectionMatrix());
+	gpuRenderer->bindViewMatrix(viewMatrix());
+	gpuRenderer->bindModelMatrix(QMatrix4x4());
+}
+
 void WalkmeshGLWidget::drawWalkmesh()
 {
 	IdFile *idFile = data->getIdFile();
 	const QVector2D texcoord;
+	const QMatrix4x4 mvp = sceneToClip();
 	// The selected triangle is noise while exits are edited, and belongs to another field while
 	// an exit's destination is shown
 	const bool showSelectedTriangle = _editMode == NoEdit || _editMode == EditWalkmesh;
@@ -240,16 +283,22 @@ void WalkmeshGLWidget::drawWalkmesh()
 	for (int i = 0; i < idFile->triangleCount(); ++i) {
 		const Triangle &triangle = idFile->triangle(i);
 		const Access &access = idFile->access(i);
-		// A triangle the game cannot use: flipped (never walked on), flat (drops the player to
-		// height 0) or past the last id the script can lock
-		const bool broken = IdFile::isFlipped(triangle) || IdFile::isFlat(triangle)
-		                    || i >= IdFile::MAX_TRIANGLES;
+		const bool broken = isBroken(triangle, i);
 
 		for (int side = 0; side < 3; ++side) {
-			QRgb color = hasSelectedTriangle && i == _selectedTriangle ? COLOR_SELECTED
-			             : broken ? COLOR_BROKEN
-			             : access.a[side] == -1 ? COLOR_WALL : COLOR_SIDE;
-			bufferLine(triangle.vertices[side], triangle.vertices[(side + 1) % 3], QRgba64::fromArgb32(color));
+			const Vertex_sr &from = triangle.vertices[side], &to = triangle.vertices[(side + 1) % 3];
+
+			// Only the sides between two triangles are thin: walls, broken and selected
+			// triangles have to be seen over any background
+			if (hasSelectedTriangle && i == _selectedTriangle) {
+				bufferWideLine(mvp, toScene(from), toScene(to), COLOR_SELECTED, WIDE_LINE_WIDTH);
+			} else if (broken) {
+				bufferWideLine(mvp, toScene(from), toScene(to), COLOR_BROKEN, WIDE_LINE_WIDTH);
+			} else if (access.a[side] == -1) {
+				bufferWideLine(mvp, toScene(from), toScene(to), COLOR_WALL, WIDE_LINE_WIDTH);
+			} else {
+				bufferLine(from, to, QRgba64::fromArgb32(COLOR_SIDE));
+			}
 		}
 	}
 
@@ -262,6 +311,7 @@ void WalkmeshGLWidget::drawWalkmesh()
 	}
 
 	gpuRenderer->draw(RendererPrimitiveType::PT_LINES);
+	drawWideLines();
 
 	if (hasSelectedTriangle) {
 		for (const Vertex_sr &vertex: idFile->triangle(_selectedTriangle).vertices) {
@@ -291,39 +341,28 @@ void WalkmeshGLWidget::drawExitsAndDoors()
 	const QVector2D texcoord;
 	const bool editingExits = _editMode == EditExits;
 
-	// Exits are drawn thick, with points all along them: lines are one pixel wide, and an exit
-	// has to stand out from the walls it usually runs along
 	const QMatrix4x4 mvp = sceneToClip();
 
+	// Exits are wider than walls: they usually run along one and have to stand out from it
 	for (int gateID = 0; gateID < 12; ++gateID) {
 		const Gateway &gate = inf->getGateway(gateID);
-		QPointF a, b;
 
 		if (!isUsed(gate)) {
 			continue;
 		}
 
 		const bool hovered = _hoveredExit == gateID || (_hoveredExitEnd && _hoveredExitEnd->gate == gateID);
-		const QRgba64 color = QRgba64::fromArgb32(editingExits && hovered ? COLOR_HOVER
-		                                          : editingExits && gateID == _selectedGate ? COLOR_SELECTED
-		                                          : COLOR_EXIT);
-		const QVector3D from = toScene(gate.exitLine[0]), to = toScene(gate.exitLine[1]);
-		const bool onScreen = toScreen(mvp, IdFile::fromVertex_s(gate.exitLine[0]), a)
-		                      && toScreen(mvp, IdFile::fromVertex_s(gate.exitLine[1]), b);
-		// A point every 2 pixels, and a sensible number when an end is behind the camera
-		const int steps = onScreen ? qBound(1, int(QLineF(a, b).length() / 2.0), 2000) : 200;
-
-		for (int step = 0; step <= steps; ++step) {
-			gpuRenderer->bufferVertex(from + (to - from) * (float(step) / steps), color, texcoord);
-		}
+		const QRgb color = editingExits && hovered ? COLOR_HOVER
+		                   : editingExits && gateID == _selectedGate ? COLOR_SELECTED
+		                   : COLOR_EXIT;
+		bufferWideLine(mvp, toScene(gate.exitLine[0]), toScene(gate.exitLine[1]), color, EXIT_LINE_WIDTH);
 	}
-
-	gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 4.0f);
 
 	for (const Trigger &trigger: inf->getTriggers()) {
-		gpuRenderer->bufferVertex(toScene(trigger.trigger_line[0]), QRgba64::fromArgb32(COLOR_DOOR), texcoord);
-		gpuRenderer->bufferVertex(toScene(trigger.trigger_line[1]), QRgba64::fromArgb32(COLOR_DOOR), texcoord);
+		bufferWideLine(mvp, toScene(trigger.trigger_line[0]), toScene(trigger.trigger_line[1]), COLOR_DOOR, WIDE_LINE_WIDTH);
 	}
+
+	drawWideLines();
 
 	// The exit a click would add, along a wall
 	if (_exitPreview) {
@@ -429,22 +468,160 @@ Vertex_sr WalkmeshGLWidget::arrivalPoint() const
 	return point;
 }
 
-QMatrix4x4 WalkmeshGLWidget::projectionMatrix() const
+// The game's projection onto its 320x224 screen, without the zoom and the letterbox of the widget
+QMatrix4x4 WalkmeshGLWidget::gameProjectionMatrix() const
 {
-	// The mesh must land in the same rectangle as the background, so project with the
-	// SCREEN aspect and letterbox that rectangle into the widget - using the widget's own
-	// aspect made the mesh drift sideways from the background on any non-4:3 window.
-	float sx = 1.0f, sy = 1.0f;
-	screenLetterbox(sx, sy);
-
-	QMatrix4x4 projection = screenMatrix();
-	projection.scale(sx, sy, 1.0f);
+	QMatrix4x4 projection;
 	projection.perspective(fovy, float(SCREEN_WIDTH) / float(SCREEN_HEIGHT), 0.001f, 1000.0f);
 
 	return projection;
 }
 
+QMatrix4x4 WalkmeshGLWidget::projectionMatrix() const
+{
+	QMatrix4x4 projection = screenMatrix();
+	const float aspect = float(width()) / float(qMax(1, height()));
+	float radius = 1.0f;
+	sceneCentre(radius);
+	const float distance = viewDistance(radius);
+
+	switch (_viewMode) {
+	case GameView: {
+		// The mesh must land in the same rectangle as the background, so project with the
+		// SCREEN aspect and letterbox that rectangle into the widget - using the widget's own
+		// aspect made the mesh drift sideways from the background on any non-4:3 window.
+		float sx = 1.0f, sy = 1.0f;
+		screenLetterbox(sx, sy);
+		projection.scale(sx, sy, 1.0f);
+		projection *= gameProjectionMatrix();
+		break;
+	}
+	case TopView: {
+		// No perspective, so distances on the floor look the same near and far; framed on the
+		// walkmesh as seen from above, which fills the view even with a long corridor
+		float halfWidth = 0.05f, halfHeight = 0.05f;
+		const QMatrix4x4 view = viewMatrix();
+		if (data && data->hasIdFile()) {
+			for (const Triangle *triangle: framedTriangles(data->getIdFile())) {
+				for (const Vertex_sr &vertex: triangle->vertices) {
+					const QVector3D seen = view.map(toScene(vertex));
+					halfWidth = qMax(halfWidth, qAbs(seen.x()));
+					halfHeight = qMax(halfHeight, qAbs(seen.y()));
+				}
+			}
+		}
+		halfWidth *= 1.05f;
+		halfHeight *= 1.05f;
+		if (halfWidth < halfHeight * aspect) {
+			halfWidth = halfHeight * aspect;
+		} else {
+			halfHeight = halfWidth / aspect;
+		}
+		projection.ortho(-halfWidth, halfWidth, -halfHeight, halfHeight, 0.01f, distance + radius * 4.0f);
+		break;
+	}
+	case FreeView:
+		projection.perspective(45.0f, aspect, 0.01f, distance + radius * 4.0f);
+		break;
+	}
+
+	return projection;
+}
+
+/**
+ * The middle of the walkmesh, and the radius of a sphere holding all of it, in scene units:
+ * the top and free views turn around it and frame it.
+ */
+QVector3D WalkmeshGLWidget::sceneCentre(float &radius) const
+{
+	if (!data || !data->hasIdFile() || data->getIdFile()->triangleCount() == 0) {
+		radius = 1.0f;
+		return QVector3D();
+	}
+
+	QVector3D minimum(1e9f, 1e9f, 1e9f), maximum(-1e9f, -1e9f, -1e9f);
+
+	for (const Triangle *triangle: framedTriangles(data->getIdFile())) {
+		for (const Vertex_sr &vertex: triangle->vertices) {
+			const QVector3D point = toScene(vertex);
+			minimum = QVector3D(qMin(minimum.x(), point.x()), qMin(minimum.y(), point.y()), qMin(minimum.z(), point.z()));
+			maximum = QVector3D(qMax(maximum.x(), point.x()), qMax(maximum.y(), point.y()), qMax(maximum.z(), point.z()));
+		}
+	}
+
+	radius = qMax(0.05f, (maximum - minimum).length() / 2.0f);
+
+	return (minimum + maximum) / 2.0f;
+}
+
+// How far the top and free cameras stand from the centre: close enough for the walkmesh to fill
+// the free view seen from the side, the wheel zooms out for the rest
+float WalkmeshGLWidget::viewDistance(float radius) const
+{
+	return radius * 1.6f;
+}
+
+// Where the game camera stands, in scene units
+bool WalkmeshGLWidget::gameCameraEye(QVector3D &eye) const
+{
+	if (!data || !data->hasCaFile() || camID >= data->getCaFile()->cameraCount()) {
+		return false;
+	}
+
+	bool invertible = false;
+	const QMatrix4x4 cameraToScene = gameViewMatrix().inverted(&invertible);
+	eye = cameraToScene.map(QVector3D());
+
+	return invertible;
+}
+
+/**
+ * Which way is up: +1 when the game camera is on the +Z side of the floor, -1 otherwise. The
+ * top and free views look from that side, so the field is not seen from below or mirrored.
+ */
+float WalkmeshGLWidget::upSide() const
+{
+	QVector3D eye;
+	float radius = 1.0f;
+	const QVector3D centre = sceneCentre(radius);
+
+	return gameCameraEye(eye) && eye.z() < centre.z() ? -1.0f : 1.0f;
+}
+
 QMatrix4x4 WalkmeshGLWidget::viewMatrix() const
+{
+	float radius = 1.0f;
+	const QVector3D centre = sceneCentre(radius);
+	const float distance = viewDistance(radius), side = upSide();
+	QMatrix4x4 view;
+
+	switch (_viewMode) {
+	case GameView:
+		return gameViewMatrix();
+	case TopView: {
+		// Straight down, turned so that what is far from the game camera is at the top, as in the game
+		QVector3D eye, forward(0.0f, 1.0f, 0.0f);
+		if (gameCameraEye(eye)) {
+			const QVector3D horizontal(centre.x() - eye.x(), centre.y() - eye.y(), 0.0f);
+			if (horizontal.lengthSquared() > 1e-8f) {
+				forward = horizontal.normalized();
+			}
+		}
+		view.lookAt(centre + QVector3D(0.0f, 0.0f, side * distance), centre, forward);
+		return view;
+	}
+	case FreeView: {
+		const float yaw = qDegreesToRadians(orbitYaw), pitch = qDegreesToRadians(orbitPitch);
+		const QVector3D direction(std::sin(pitch) * std::cos(yaw), std::sin(pitch) * std::sin(yaw), side * std::cos(pitch));
+		view.lookAt(centre + direction * distance, centre, QVector3D(0.0f, 0.0f, side));
+		return view;
+	}
+	}
+
+	return view;
+}
+
+QMatrix4x4 WalkmeshGLWidget::gameViewMatrix() const
 {
 	QMatrix4x4 view;
 
@@ -492,22 +669,11 @@ QMatrix4x4 WalkmeshGLWidget::screenMatrix() const
 	return screen;
 }
 
-// The rotation sliders turn the walkmesh alone, to look at its heights: the background cannot follow
-QMatrix4x4 WalkmeshGLWidget::modelMatrix() const
-{
-	QMatrix4x4 model;
-	model.rotate(xRot, 1.0f, 0.0f, 0.0f);
-	model.rotate(yRot, 0.0f, 1.0f, 0.0f);
-	model.rotate(zRot, 0.0f, 0.0f, 1.0f);
-
-	return model;
-}
-
 // Everything picking needs goes through the matrices used for drawing, so what a click hits is
 // always exactly what is on screen
 QMatrix4x4 WalkmeshGLWidget::sceneToClip() const
 {
-	return projectionMatrix() * viewMatrix() * modelMatrix();
+	return projectionMatrix() * viewMatrix();
 }
 
 void WalkmeshGLWidget::bufferLine(const Vertex_sr &from, const Vertex_sr &to, QRgba64 color, bool dashed)
@@ -527,6 +693,136 @@ void WalkmeshGLWidget::bufferLine(const Vertex_sr &from, const Vertex_sr &to, QR
 		gpuRenderer->bufferVertex(a + (b - a) * (float(i) / DASHES), color, texcoord);
 		gpuRenderer->bufferVertex(a + (b - a) * (float(i + 1) / DASHES), color, texcoord);
 	}
+}
+
+/**
+ * A line `pixels` wide, as two triangles facing the screen: OpenGL lines are one pixel wide on
+ * most drivers. The triangles are kept in screen coordinates and drawn by drawWideLines().
+ */
+void WalkmeshGLWidget::bufferWideLine(const QMatrix4x4 &sceneToClip, const QVector3D &from, const QVector3D &to,
+                                      QRgb color, float pixels)
+{
+	const float NEAR_W = 1e-4f;
+	QVector4D a = sceneToClip * QVector4D(from, 1.0f), b = sceneToClip * QVector4D(to, 1.0f);
+
+	// Keep only the part in front of the camera
+	if (a.w() < NEAR_W && b.w() < NEAR_W) {
+		return;
+	} else if (a.w() < NEAR_W) {
+		a += (b - a) * ((NEAR_W - a.w()) / (b.w() - a.w()));
+	} else if (b.w() < NEAR_W) {
+		b += (a - b) * ((NEAR_W - b.w()) / (a.w() - b.w()));
+	}
+
+	const QVector3D screenA = a.toVector3DAffine(), screenB = b.toVector3DAffine();
+	QVector2D direction((screenB.x() - screenA.x()) * width(), (screenB.y() - screenA.y()) * height());
+	if (direction.lengthSquared() < 1e-12f) {
+		direction = QVector2D(1.0f, 0.0f);
+	}
+	direction.normalize();
+	// Half the width on each side; the screen is 2 units wide for width() pixels
+	const QVector3D offset(-direction.y() * pixels / width(), direction.x() * pixels / height(), 0.0f);
+	const QRgba64 rgba = QRgba64::fromArgb32(color);
+
+	for (const QVector3D &corner: {screenA - offset, screenA + offset, screenB + offset,
+	                               screenA - offset, screenB + offset, screenB - offset}) {
+		_wideLineVertices.append(ScreenVertex{corner, rgba});
+	}
+}
+
+void WalkmeshGLWidget::drawWideLines()
+{
+	if (_wideLineVertices.isEmpty()) {
+		return;
+	}
+
+	const QMatrix4x4 identity;
+	const QVector2D texcoord;
+	gpuRenderer->bindProjectionMatrix(identity);
+	gpuRenderer->bindViewMatrix(identity);
+
+	for (const ScreenVertex &vertex: _wideLineVertices) {
+		gpuRenderer->bufferVertex(vertex.position, vertex.color, texcoord);
+	}
+	gpuRenderer->draw(RendererPrimitiveType::PT_TRIANGLES);
+	_wideLineVertices.clear();
+
+	bindSceneMatrices();
+}
+
+/**
+ * The background painted onto the walkmesh, for the top and free views where the flat picture
+ * cannot be shown: each point of the floor takes the colour the game camera sees there. What
+ * stands in front of the floor in the game (a lamp post, a character) is painted onto it too.
+ */
+void WalkmeshGLWidget::drawBackgroundOnFloor()
+{
+	if (!data->hasCaFile() || camID >= data->getCaFile()->cameraCount()) {
+		return;
+	}
+
+	const QMatrix4x4 gameToClip = gameProjectionMatrix() * gameViewMatrix();
+	const QRgba64 white = QRgba64::fromArgb32(0xFFFFFFFF);
+	const QVector2D pictureSize(tex.width(), tex.height());
+	// Where a scene point is in the background picture; false when the game camera does not see it
+	auto pictureCoordinates = [&](const QVector3D &point, QVector2D &uv) {
+		const QVector4D clip = gameToClip * QVector4D(point, 1.0f);
+		if (clip.w() <= 0.0f) {
+			return false;
+		}
+		uv = QVector2D(0.5f + clip.x() / clip.w() * 0.5f * SCREEN_WIDTH / tex.width(),
+		               0.5f - clip.y() / clip.w() * 0.5f * SCREEN_HEIGHT / tex.height());
+		return uv.x() >= 0.0f && uv.x() <= 1.0f && uv.y() >= 0.0f && uv.y() <= 1.0f;
+	};
+
+	for (const Triangle &triangle: data->getIdFile()->getTriangles()) {
+		const QVector3D a = toScene(triangle.vertices[0]), b = toScene(triangle.vertices[1]), c = toScene(triangle.vertices[2]);
+		QVector2D uvA, uvB, uvC;
+		pictureCoordinates(a, uvA);
+		pictureCoordinates(b, uvB);
+		pictureCoordinates(c, uvC);
+
+		// The picture is a perspective view, which a triangle cannot follow exactly: big triangles
+		// are cut in smaller ones, about every 16 pixels of the picture
+		const float longest = qMax(qMax(((uvB - uvA) * pictureSize).length(), ((uvC - uvB) * pictureSize).length()),
+		                           ((uvA - uvC) * pictureSize).length());
+		const int cuts = qBound(1, int(longest / 16.0f), 16);
+
+		for (int i = 0; i < cuts; ++i) {
+			for (int j = 0; j < cuts - i; ++j) {
+				// The cell (i, j) of a grid spread over the triangle: one small triangle, and a
+				// second one except along the far side
+				const QPoint cells[2][3] = {
+				    {QPoint(i, j), QPoint(i + 1, j), QPoint(i, j + 1)},
+				    {QPoint(i + 1, j), QPoint(i + 1, j + 1), QPoint(i, j + 1)}
+				};
+				const int cellCount = j < cuts - i - 1 ? 2 : 1;
+
+				for (int cell = 0; cell < cellCount; ++cell) {
+					QVector3D corners[3];
+					QVector2D uvs[3];
+					bool seen = true;
+
+					for (int k = 0; k < 3 && seen; ++k) {
+						const float u = float(cells[cell][k].x()) / cuts, v = float(cells[cell][k].y()) / cuts;
+						corners[k] = a + (b - a) * u + (c - a) * v;
+						seen = pictureCoordinates(corners[k], uvs[k]);
+					}
+
+					if (seen) {
+						for (int k = 0; k < 3; ++k) {
+							gpuRenderer->bufferVertex(corners[k], white, uvs[k]);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	gpuRenderer->bindTexture(tex);
+	gpuRenderer->draw(RendererPrimitiveType::PT_TRIANGLES);
+	// The walkmesh lies exactly on this floor: without this its lines would be hidden half the time
+	gpuRenderer->clearDepth();
 }
 
 bool WalkmeshGLWidget::toScreen(const QMatrix4x4 &sceneToClip, const Vertex_sr &point, QPointF &screen) const
@@ -990,9 +1286,14 @@ void WalkmeshGLWidget::mousePressEvent(QMouseEvent *event)
 	}
 	else if (event->button() == Qt::RightButton)
 	{
-		// The view moves with the right button, leaving the left one to edit the walkmesh
+		// The view moves with the right button, leaving the left one to edit the walkmesh; in
+		// the free view it turns around the walkmesh, and moves with Shift
 		moveStart = event->pos();
-		_panning = true;
+		if (_viewMode == FreeView && !(event->modifiers() & Qt::ShiftModifier)) {
+			_orbiting = true;
+		} else {
+			_panning = true;
+		}
 	}
 	else if (event->button() == Qt::LeftButton)
 	{
@@ -1060,6 +1361,12 @@ void WalkmeshGLWidget::mouseMoveEvent(QMouseEvent *event)
 	if (_panning && (event->buttons() & Qt::RightButton)) {
 		panView(event->pos() - moveStart);
 		moveStart = event->pos();
+	} else if (_orbiting && (event->buttons() & Qt::RightButton)) {
+		const QPoint moved = event->pos() - moveStart;
+		orbitYaw -= moved.x() * 0.4f;
+		orbitPitch = qBound(1.0f, orbitPitch - moved.y() * 0.4f, 179.0f);
+		moveStart = event->pos();
+		update();
 	} else if (_dragging && (event->buttons() & Qt::LeftButton)) {
 		Vertex_sr target;
 
@@ -1099,6 +1406,7 @@ void WalkmeshGLWidget::mouseReleaseEvent(QMouseEvent *event)
 {
 	if (event->button() == Qt::RightButton) {
 		_panning = false;
+		_orbiting = false;
 	} else if (event->button() == Qt::LeftButton && _dragging) {
 		// Dropped onto another point: snap to it, which merges the two
 		const std::optional<Vertex_sr> target = pointAt(event->pos(), _draggedPoint);
@@ -1213,41 +1521,6 @@ void WalkmeshGLWidget::focusOutEvent(QFocusEvent *event)
 	QWidget::focusOutEvent(event);
 }
 
-static void qNormalizeAngle(int &angle)
-{
-	while (angle < 0)
-		angle += 360 * 16;
-	while (angle > 360 * 16)
-		angle -= 360 * 16;
-}
-
-void WalkmeshGLWidget::setXRotation(int angle)
-{
-	qNormalizeAngle(angle);
-	if (angle != xRot) {
-		xRot = angle;
-		update();
-	}
-}
-
-void WalkmeshGLWidget::setYRotation(int angle)
-{
-	qNormalizeAngle(angle);
-	if (angle != yRot) {
-		yRot = angle;
-		update();
-	}
-}
-
-void WalkmeshGLWidget::setZRotation(int angle)
-{
-	qNormalizeAngle(angle);
-	if (angle != zRot) {
-		zRot = angle;
-		update();
-	}
-}
-
 void WalkmeshGLWidget::setZoom(int zoom)
 {
 	viewZoom = qBound(0.25f, zoom / 4096.0f, 32.0f);
@@ -1258,8 +1531,39 @@ void WalkmeshGLWidget::resetCamera()
 {
 	viewZoom = 1.0f;
 	viewPanX = viewPanY = 0.0f;
-	zRot = yRot = xRot = 0;
+	resetOrbit();
 	update();
+}
+
+// The free view starts where the game camera is, so switching to it does not lose the field
+void WalkmeshGLWidget::resetOrbit()
+{
+	QVector3D eye;
+	float radius = 1.0f;
+	const QVector3D centre = sceneCentre(radius);
+
+	orbitYaw = -90.0f;
+	orbitPitch = 45.0f;
+
+	if (gameCameraEye(eye) && (eye - centre).lengthSquared() > 1e-8f) {
+		const QVector3D direction = (eye - centre).normalized();
+		orbitYaw = qRadiansToDegrees(std::atan2(direction.y(), direction.x()));
+		orbitPitch = qBound(1.0f, qRadiansToDegrees(std::acos(qBound(-1.0f, direction.z() * upSide(), 1.0f))), 179.0f);
+	}
+}
+
+void WalkmeshGLWidget::setViewMode(ViewMode mode)
+{
+	if (mode == _viewMode) {
+		return;
+	}
+
+	_viewMode = mode;
+	_panning = _orbiting = false;
+	viewZoom = 1.0f;
+	viewPanX = viewPanY = 0.0f;
+	resetOrbit();
+	clearPointSelection();
 }
 
 void WalkmeshGLWidget::setCurrentFieldCamera(int camID)

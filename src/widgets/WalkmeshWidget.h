@@ -45,6 +45,7 @@ public:
 public slots:
 	void resetCamera();
 	void setCurrentCamera(int camID);
+	void changeViewMode();
 private slots:
 	void addCamera();
 	void removeCamera();
@@ -139,7 +140,8 @@ private:
 	// A destination opened from loose files, owned here
 	FieldLoose *looseDestination;
 	QCheckBox *showBackground;
-	QSlider *slider1, *slider2, *slider3;
+	QComboBox *viewMode;
+	QLabel *viewInfos;
 	QTabWidget *tabWidget;
 	//CamPage
 	QToolBar *caToolbar;
