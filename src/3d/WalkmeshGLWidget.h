@@ -34,6 +34,16 @@ public:
 		PickArrival   // the view shows an exit's destination field: click its floor to place the arrival
 	};
 
+	// Each colour always means the same thing, whatever the tab; WalkmeshWidget shows the legend
+	static constexpr QRgb COLOR_SIDE = 0xFFFFFFFF;     // side between two triangles
+	static constexpr QRgb COLOR_WALL = 0xFF6699CC;     // side with nothing across it
+	static constexpr QRgb COLOR_BROKEN = 0xFFFF2020;   // triangle the game cannot use
+	static constexpr QRgb COLOR_EXIT = 0xFFFF40FF;     // exit line
+	static constexpr QRgb COLOR_DOOR = 0xFF00FF00;     // door trigger line
+	static constexpr QRgb COLOR_SCRIPT = 0xFFFF00FF;   // line of a script (drawn instead of exits and doors)
+	static constexpr QRgb COLOR_SELECTED = 0xFFFF9000; // what the form shows
+	static constexpr QRgb COLOR_HOVER = 0xFFFFE040;    // what a click would grab or add
+
 	explicit WalkmeshGLWidget(QWidget *parent = nullptr);
 	virtual ~WalkmeshGLWidget() override;
 	void clear();
@@ -80,6 +90,8 @@ private:
 	static const int SCREEN_WIDTH = 320, SCREEN_HEIGHT = 224;
 	// How close to a point, in pixels, the mouse has to be to grab it
 	static const int PICK_RADIUS = 10;
+	// How close to a wall, in pixels, the mouse has to be to add a triangle on it
+	static const int ADD_RADIUS = 60;
 	// The triangle a click would add while the mouse is off the floor: a border side and a point
 	struct SidePreview {
 		int triangleID;
@@ -108,6 +120,7 @@ private:
 	void drawArrival();
 	QMatrix4x4 projectionMatrix() const;
 	QMatrix4x4 viewMatrix() const;
+	QMatrix4x4 screenMatrix() const;
 	QMatrix4x4 modelMatrix() const;
 	QMatrix4x4 sceneToClip() const;
 	bool toScreen(const QMatrix4x4 &sceneToClip, const Vertex_sr &point, QPointF &screen) const;
@@ -122,12 +135,15 @@ private:
 	std::optional<FloorPoint> floorAt(const QPoint &pos) const;
 	Vertex_sr arrivalPoint() const;
 	void updateHover(const QPoint &pos);
+	void zoomView(const QPointF &pos, float factor);
+	void panView(const QPointF &pixels);
 	void pressOnWalkmesh();
 	void pressOnExits();
 	void bufferLine(const Vertex_sr &from, const Vertex_sr &to, QRgba64 color, bool dashed = false);
-	double distance;
+	// Zoom and move of the view, in normalized device coordinates (the widget is -1..1)
+	float viewZoom, viewPanX, viewPanY;
 	float xRot, yRot, zRot;
-	float xTrans, yTrans, transStep;
+	float transStep;
 	int lastKeyPressed;
 	int camID;
 	int _selectedTriangle;

@@ -94,9 +94,28 @@ void WalkmeshWidget::build()
 	slider2->setValue(0);
 	slider3->setValue(0);
 
-	QLabel *keyInfos = new QLabel(tr("Use the arrow keys to move the camera."));
+	QLabel *keyInfos = new QLabel(tr("Right-drag or the arrow keys move the view, the wheel zooms, "
+	                                 "a middle click resets it."));
 	keyInfos->setTextFormat(Qt::PlainText);
 	keyInfos->setWordWrap(true);
+
+	// What the colours of the view mean, with the very colours it uses
+	auto legendLine = [](QRgb color, const QString &meaning) {
+		return QString("<span style=\"background-color:#303030; color:%1\">&nbsp;&#9632;&nbsp;</span> %2")
+		        .arg(QColor(color).name(), meaning.toHtmlEscaped());
+	};
+	QLabel *legend = new QLabel(QStringList{
+	    legendLine(WalkmeshGLWidget::COLOR_SIDE, tr("Side between two triangles")),
+	    legendLine(WalkmeshGLWidget::COLOR_WALL, tr("Wall: nothing across this side")),
+	    legendLine(WalkmeshGLWidget::COLOR_BROKEN, tr("Triangle the game cannot use (flipped, flat, or past triangle 511)")),
+	    legendLine(WalkmeshGLWidget::COLOR_EXIT, tr("Exit (thick line)")),
+	    legendLine(WalkmeshGLWidget::COLOR_DOOR, tr("Door trigger")),
+	    legendLine(WalkmeshGLWidget::COLOR_SELECTED, tr("Selected: what the form shows")),
+	    legendLine(WalkmeshGLWidget::COLOR_HOVER, tr("Under the mouse: what a click grabs, or adds when dashed"))
+	}.join("<br>"));
+	legend->setTextFormat(Qt::RichText);
+	legend->setWordWrap(true);
+	legend->setMaximumWidth(260); // wraps instead of widening the column and shrinking the view
 
 	QPushButton *resetCamera = new QPushButton(tr("Reset"));
 
@@ -114,14 +133,15 @@ void WalkmeshWidget::build()
 	tabWidget->setFixedHeight(250);
 
 	QGridLayout *layout = new QGridLayout(this);
-	layout->addWidget(walkmeshGL, 0, 0, 4, 1);
+	layout->addWidget(walkmeshGL, 0, 0, 5, 1);
 	layout->addWidget(slider1, 0, 1, Qt::AlignLeft);
 	layout->addWidget(slider2, 0, 2, Qt::AlignHCenter);
 	layout->addWidget(slider3, 0, 3, Qt::AlignRight);
 	layout->addWidget(keyInfos, 1, 1, 1, 3);
 	layout->addWidget(resetCamera, 2, 1, 1, 3);
 	layout->addWidget(showBackground, 3, 1, 1, 3);
-	layout->addWidget(tabWidget, 4, 0, 1, 4);
+	layout->addWidget(legend, 4, 1, 1, 3, Qt::AlignTop);
+	layout->addWidget(tabWidget, 5, 0, 1, 4);
 	layout->setColumnStretch(0, 1);
 	layout->setContentsMargins(QMargins());
 

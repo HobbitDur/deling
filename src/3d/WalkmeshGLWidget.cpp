@@ -19,16 +19,6 @@
 #include <cmath>
 #include <limits>
 
-// Each colour always means the same thing, whatever the tab
-static const QRgb COLOR_SIDE = 0xFFFFFFFF;     // side between two triangles
-static const QRgb COLOR_WALL = 0xFF6699CC;     // side with nothing across it
-static const QRgb COLOR_BROKEN = 0xFFFF2020;   // triangle the game cannot use
-static const QRgb COLOR_EXIT = 0xFFFF40FF;     // exit line
-static const QRgb COLOR_DOOR = 0xFF00FF00;     // door trigger line
-static const QRgb COLOR_SCRIPT = 0xFFFF00FF;   // line of a script (drawn instead of exits and doors)
-static const QRgb COLOR_SELECTED = 0xFFFF9000; // what the form shows
-static const QRgb COLOR_HOVER = 0xFFFFE040;    // what a click would grab or add
-
 // Walkmesh coordinates are drawn divided by 4096
 static QVector3D toScene(const Vertex_sr &point)
 {
@@ -61,8 +51,8 @@ static qreal distanceToSegment(const QPointF &p, const QPointF &a, const QPointF
 
 WalkmeshGLWidget::WalkmeshGLWidget(QWidget *parent)
     : QOpenGLWidget(parent),
-      distance(0.0), xRot(0.0f), yRot(0.0f), zRot(0.0f),
-      xTrans(0.0f), yTrans(0.0f), transStep(360.0f), lastKeyPressed(-1),
+      viewZoom(1.0f), viewPanX(0.0f), viewPanY(0.0f), xRot(0.0f), yRot(0.0f), zRot(0.0f),
+      transStep(360.0f), lastKeyPressed(-1),
       camID(0), _selectedTriangle(-1), _selectedDoor(-1), _selectedGate(-1),
       _lineToDrawPoint1(Vertex()), _lineToDrawPoint2(Vertex()),
       fovy(70.0), data(nullptr), curFrame(0), gpuRenderer(nullptr), _drawLine(false),
@@ -447,7 +437,7 @@ QMatrix4x4 WalkmeshGLWidget::projectionMatrix() const
 	float sx = 1.0f, sy = 1.0f;
 	screenLetterbox(sx, sy);
 
-	QMatrix4x4 projection;
+	QMatrix4x4 projection = screenMatrix();
 	projection.scale(sx, sy, 1.0f);
 	projection.perspective(fovy, float(SCREEN_WIDTH) / float(SCREEN_HEIGHT), 0.001f, 1000.0f);
 
@@ -488,10 +478,24 @@ QMatrix4x4 WalkmeshGLWidget::viewMatrix() const
 	return view;
 }
 
+/**
+ * Zooming and moving the view act on the picture the game shows, background and walkmesh
+ * together, like zooming into a screenshot: moving the walkmesh alone in 3D made it slide off
+ * the background it has to match.
+ */
+QMatrix4x4 WalkmeshGLWidget::screenMatrix() const
+{
+	QMatrix4x4 screen;
+	screen.translate(viewPanX, viewPanY);
+	screen.scale(viewZoom, viewZoom, 1.0f);
+
+	return screen;
+}
+
+// The rotation sliders turn the walkmesh alone, to look at its heights: the background cannot follow
 QMatrix4x4 WalkmeshGLWidget::modelMatrix() const
 {
 	QMatrix4x4 model;
-	model.translate(xTrans, yTrans, distance);
 	model.rotate(xRot, 1.0f, 0.0f, 0.0f);
 	model.rotate(yRot, 0.0f, 1.0f, 0.0f);
 	model.rotate(zRot, 0.0f, 0.0f, 1.0f);
@@ -539,10 +543,6 @@ bool WalkmeshGLWidget::toScreen(const QMatrix4x4 &sceneToClip, const Vertex_sr &
 	return true;
 }
 
-/**
- * Where the mouse points on the horizontal plane at `planeHeight`: a point is dragged along the
- * floor at its own height, so it moves over the ground seen through the game camera.
- */
 // The mouse ray in scene coordinates, from the near plane to the far plane
 bool WalkmeshGLWidget::mouseRay(const QPoint &pos, QVector3D &nearPoint, QVector3D &farPoint) const
 {
@@ -562,6 +562,10 @@ bool WalkmeshGLWidget::mouseRay(const QPoint &pos, QVector3D &nearPoint, QVector
 	return true;
 }
 
+/**
+ * Where the mouse points on the horizontal plane at `planeHeight`: a point is dragged along the
+ * floor at its own height, so it moves over the ground seen through the game camera.
+ */
 bool WalkmeshGLWidget::mouseOnHeight(const QPoint &pos, qint16 planeHeight, Vertex_sr &point) const
 {
 	QVector3D nearPoint, farPoint;
@@ -576,7 +580,21 @@ bool WalkmeshGLWidget::mouseOnHeight(const QPoint &pos, qint16 planeHeight, Vert
 		return false; // looking along the plane
 	}
 
-	const QVector3D hit = nearPoint + (farPoint - nearPoint) * ((planeZ - nearPoint.z()) / dz);
+	const float t = (planeZ - nearPoint.z()) / dz;
+
+	// Behind the camera or past the far plane: the mouse is above the horizon of that plane,
+	// on a wall of the background for instance, and the point would land out of sight
+	if (t < 0.0f || t > 1.0f) {
+		return false;
+	}
+
+	const QVector3D hit = nearPoint + (farPoint - nearPoint) * t;
+
+	// Too far for the 16-bit coordinates of the file: rounding it to the limit would put the
+	// point somewhere else than under the mouse
+	if (qAbs(hit.x() * 4096.0f) > 32767.0f || qAbs(hit.y() * 4096.0f) > 32767.0f) {
+		return false;
+	}
 
 	point.x = toCoordinate(hit.x());
 	point.y = toCoordinate(hit.y());
@@ -718,7 +736,7 @@ std::optional<WalkmeshGLWidget::SidePreview> WalkmeshGLWidget::sidePreviewAt(con
 			}
 
 			const qreal distance = distanceToSegment(QPointF(pos), a, b);
-			if (distance < nearestDistance) {
+			if (distance <= ADD_RADIUS && distance < nearestDistance) {
 				nearestDistance = distance;
 				nearestTriangle = triangleID;
 				nearestSide = side;
@@ -924,7 +942,7 @@ void WalkmeshGLWidget::drawBackground()
 
 		QMatrix4x4 mBG;
 
-		gpuRenderer->bindProjectionMatrix(mBG);
+		gpuRenderer->bindProjectionMatrix(screenMatrix());
 		gpuRenderer->bindViewMatrix(mBG);
 		gpuRenderer->bindModelMatrix(mBG);
 
@@ -940,7 +958,26 @@ void WalkmeshGLWidget::wheelEvent(QWheelEvent *event)
 	setFocus();
 	// angleDelta() is what a regular mouse wheel reports: pixelDelta() stays null for one on
 	// Windows, and its horizontal component was read, so the wheel did nothing there
-	distance += event->angleDelta().y() / 4096.0;
+	zoomView(event->position(), event->angleDelta().y() > 0 ? 1.25f : 0.8f);
+}
+
+// Zoom by factor, keeping what is under the mouse where it is
+void WalkmeshGLWidget::zoomView(const QPointF &pos, float factor)
+{
+	const float newZoom = qBound(0.25f, viewZoom * factor, 32.0f);
+	const float ndcX = 2.0f * float(pos.x()) / width() - 1.0f, ndcY = 1.0f - 2.0f * float(pos.y()) / height();
+
+	// The point under the mouse is at ndc = zoom * p + pan before and after
+	viewPanX = ndcX - (ndcX - viewPanX) * newZoom / viewZoom;
+	viewPanY = ndcY - (ndcY - viewPanY) * newZoom / viewZoom;
+	viewZoom = newZoom;
+	updateHover(pos.toPoint());
+}
+
+void WalkmeshGLWidget::panView(const QPointF &pixels)
+{
+	viewPanX += 2.0f * float(pixels.x()) / width();
+	viewPanY -= 2.0f * float(pixels.y()) / height();
 	update();
 }
 
@@ -949,8 +986,7 @@ void WalkmeshGLWidget::mousePressEvent(QMouseEvent *event)
 	setFocus();
 	if (event->button() == Qt::MiddleButton)
 	{
-		distance = -35;
-		update();
+		resetCamera();
 	}
 	else if (event->button() == Qt::RightButton)
 	{
@@ -1022,10 +1058,8 @@ void WalkmeshGLWidget::mouseMoveEvent(QMouseEvent *event)
 	// buttons(), not button(): for a move event button() is always Qt::NoButton, which is why
 	// dragging never moved the view before
 	if (_panning && (event->buttons() & Qt::RightButton)) {
-		xTrans += (event->pos().x() - moveStart.x()) / 4096.0;
-		yTrans -= (event->pos().y() - moveStart.y()) / 4096.0;
+		panView(event->pos() - moveStart);
 		moveStart = event->pos();
-		update();
 	} else if (_dragging && (event->buttons() & Qt::LeftButton)) {
 		Vertex_sr target;
 
@@ -1150,20 +1184,16 @@ void WalkmeshGLWidget::keyPressEvent(QKeyEvent *event)
 	switch (event->key())
 	{
 	case Qt::Key_Left:
-		xTrans += 1.0f/transStep;
-		update();
+		panView(QPointF(width() * 0.5f / transStep, 0.0f));
 		break;
 	case Qt::Key_Right:
-		xTrans -= 1.0f/transStep;
-		update();
+		panView(QPointF(-width() * 0.5f / transStep, 0.0f));
 		break;
 	case Qt::Key_Down:
-		yTrans += 1.0f/transStep;
-		update();
+		panView(QPointF(0.0f, -height() * 0.5f / transStep));
 		break;
 	case Qt::Key_Up:
-		yTrans -= 1.0f/transStep;
-		update();
+		panView(QPointF(0.0f, height() * 0.5f / transStep));
 		break;
 	default:
 		QWidget::keyPressEvent(event);
@@ -1220,14 +1250,15 @@ void WalkmeshGLWidget::setZRotation(int angle)
 
 void WalkmeshGLWidget::setZoom(int zoom)
 {
-	distance = zoom / 4096.0;
+	viewZoom = qBound(0.25f, zoom / 4096.0f, 32.0f);
+	update();
 }
 
 void WalkmeshGLWidget::resetCamera()
 {
-	distance = 0;
+	viewZoom = 1.0f;
+	viewPanX = viewPanY = 0.0f;
 	zRot = yRot = xRot = 0;
-	xTrans = yTrans = 0;
 	update();
 }
 
