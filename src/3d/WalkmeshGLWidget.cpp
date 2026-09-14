@@ -16,6 +16,23 @@
  ** along with this program.  If not, see <http://www.gnu.org/licenses/>.
  ****************************************************************************/
 #include "WalkmeshGLWidget.h"
+#include <cmath>
+#include <limits>
+
+// Walkmesh coordinates are drawn divided by 4096
+static QVector3D toScene(const Vertex_sr &point)
+{
+	return QVector3D(point.x / 4096.0f, point.y / 4096.0f, point.z / 4096.0f);
+}
+
+static qreal distanceToSegment(const QPointF &p, const QPointF &a, const QPointF &b)
+{
+	const QPointF ab = b - a;
+	const qreal lengthSquared = QPointF::dotProduct(ab, ab);
+	const qreal t = lengthSquared > 0.0 ? qBound(0.0, QPointF::dotProduct(p - a, ab) / lengthSquared, 1.0) : 0.0;
+
+	return QLineF(p, a + ab * t).length();
+}
 
 WalkmeshGLWidget::WalkmeshGLWidget(QWidget *parent)
     : QOpenGLWidget(parent),
@@ -24,7 +41,7 @@ WalkmeshGLWidget::WalkmeshGLWidget(QWidget *parent)
       camID(0), _selectedTriangle(-1), _selectedDoor(-1), _selectedGate(-1),
       _lineToDrawPoint1(Vertex()), _lineToDrawPoint2(Vertex()),
       fovy(70.0), data(nullptr), curFrame(0), gpuRenderer(nullptr), _drawLine(false),
-      _backgroundVisible(true)
+      _backgroundVisible(true), _editable(false), _dragging(false), _panning(false)
 {
 	// setMouseTracking(true);
 	// startTimer(100);
@@ -46,7 +63,8 @@ void WalkmeshGLWidget::clear()
 {
 	data = nullptr;
 	tex = QImage();
-	
+	clearPointSelection();
+
 	update();
 	
 	if (gpuRenderer) {
@@ -59,8 +77,30 @@ void WalkmeshGLWidget::fill(Field *data)
 	this->data = data;
 	// A field opened from loose files may have a walkmesh and no background at all
 	tex = data->hasBackgroundFile() ? data->getBackgroundFile()->background() : QImage();
+	clearPointSelection();
 	updatePerspective();
 	resetCamera();
+}
+
+void WalkmeshGLWidget::setEditable(bool editable)
+{
+	_editable = editable;
+	// Highlighting the point under the mouse needs move events with no button held
+	setMouseTracking(editable);
+
+	if (!editable) {
+		clearPointSelection();
+	}
+}
+
+void WalkmeshGLWidget::clearPointSelection()
+{
+	_hoveredPoint.reset();
+	_selectedPoint.reset();
+	_draggedPoint.reset();
+	_sidePreview.reset();
+	_dragging = false;
+	update();
 }
 
 /**
@@ -132,82 +172,37 @@ void WalkmeshGLWidget::paintGL()
 		drawBackground();
 	}
 
-	// The mesh must land in the same rectangle as the background, so project with the
-	// SCREEN aspect and letterbox that rectangle into the widget - using the widget's own
-	// aspect made the mesh drift sideways from the background on any non-4:3 window.
-	float sx = 1.0f, sy = 1.0f;
-	screenLetterbox(sx, sy);
-	mProjection.setToIdentity();
-	mProjection.scale(sx, sy, 1.0f);
-	mProjection.perspective(fovy, float(SCREEN_WIDTH) / float(SCREEN_HEIGHT), 0.001f, 1000.0f);
-	gpuRenderer->bindProjectionMatrix(mProjection);
-
-	QMatrix4x4 mModel;
-	mModel.translate(xTrans, yTrans, distance);
-	mModel.rotate(xRot, 1.0f, 0.0f, 0.0f);
-	mModel.rotate(yRot, 0.0f, 1.0f, 0.0f);
-	mModel.rotate(zRot, 0.0f, 0.0f, 1.0f);
-
-	QMatrix4x4 mView;
-
-	if (data->hasCaFile() && data->getCaFile()->cameraCount() > 0 && camID < data->getCaFile()->cameraCount()) {
-		const Camera &cam = data->getCaFile()->camera(camID);
-
-		double camAxisXx = cam.camera_axis[0].x / 4096.0;
-		double camAxisXy = cam.camera_axis[0].y / 4096.0;
-		double camAxisXz = cam.camera_axis[0].z / 4096.0;
-
-		double camAxisYx = -cam.camera_axis[1].x / 4096.0;
-		double camAxisYy = -cam.camera_axis[1].y / 4096.0;
-		double camAxisYz = -cam.camera_axis[1].z / 4096.0;
-
-		double camAxisZx = cam.camera_axis[2].x / 4096.0;
-		double camAxisZy = cam.camera_axis[2].y / 4096.0;
-		double camAxisZz = cam.camera_axis[2].z / 4096.0;
-
-		double camPosX = cam.camera_position[0] / 4096.0;
-		double camPosY = -cam.camera_position[1] / 4096.0;
-		double camPosZ = cam.camera_position[2] / 4096.0;
-
-		double tx = -(camPosX*camAxisXx + camPosY*camAxisYx + camPosZ*camAxisZx);
-		double ty = -(camPosX*camAxisXy + camPosY*camAxisYy + camPosZ*camAxisZy);
-		double tz = -(camPosX*camAxisXz + camPosY*camAxisYz + camPosZ*camAxisZz);
-
-		const QVector3D eye(tx, ty, tz), center(tx + camAxisZx, ty + camAxisZy, tz + camAxisZz), up(camAxisYx, camAxisYy, camAxisYz);
-		mView.lookAt(eye, center, up);
-	}
-
-	gpuRenderer->bindModelMatrix(mModel);
-	gpuRenderer->bindViewMatrix(mView);
+	gpuRenderer->bindProjectionMatrix(projectionMatrix());
+	gpuRenderer->bindModelMatrix(modelMatrix());
+	gpuRenderer->bindViewMatrix(viewMatrix());
 
 	if (data->hasIdFile()) {
+		IdFile *idFile = data->getIdFile();
 		int i=0;
 
-		for (const Triangle &triangle: data->getIdFile()->getTriangles()) {
-			const Access &access = data->getIdFile()->access(i);
+		for (const Triangle &triangle: idFile->getTriangles()) {
+			const Access &access = idFile->access(i);
+			// Red: a triangle the game cannot use - flipped (never walked on), flat (drops the
+			// player to height 0) or past the last id the script can lock
+			const bool broken = IdFile::isFlipped(triangle) || IdFile::isFlat(triangle)
+			                    || i >= IdFile::MAX_TRIANGLES;
 
-			// Vertex info
-			QVector3D positionA(triangle.vertices[0].x / 4096.0, triangle.vertices[0].y / 4096.0, triangle.vertices[0].z / 4096.0),
-								positionB(triangle.vertices[1].x / 4096.0, triangle.vertices[1].y / 4096.0, triangle.vertices[1].z / 4096.0),
-								positionC(triangle.vertices[2].x / 4096.0, triangle.vertices[2].y / 4096.0, triangle.vertices[2].z / 4096.0);
-			QRgba64   color1 = QRgba64::fromArgb32((i == _selectedTriangle ? 0xFFFF9000 : (access.a[0] == -1 ? 0xFF6699CC : 0xFFFFFFFF))),
-								color2 = QRgba64::fromArgb32((i == _selectedTriangle ? 0xFFFF9000 : (access.a[1] == -1 ? 0xFF6699CC : 0xFFFFFFFF))),
-								color3 = QRgba64::fromArgb32((i == _selectedTriangle ? 0xFFFF9000 : (access.a[2] == -1 ? 0xFF6699CC : 0xFFFFFFFF)));
-			QVector2D texcoord;
-
-			// Line
-			gpuRenderer->bufferVertex(positionA, color1, texcoord);
-			gpuRenderer->bufferVertex(positionB, color1, texcoord);
-
-			// Line
-			gpuRenderer->bufferVertex(positionB, color2, texcoord);
-			gpuRenderer->bufferVertex(positionC, color2, texcoord);
-
-			// Line
-			gpuRenderer->bufferVertex(positionC, color3, texcoord);
-			gpuRenderer->bufferVertex(positionA, color3, texcoord);
+			for (int side = 0; side < 3; ++side) {
+				QRgb color = i == _selectedTriangle ? 0xFFFF9000
+				             : broken ? 0xFFFF2020
+				             : access.a[side] == -1 ? 0xFF6699CC : 0xFFFFFFFF;
+				bufferLine(triangle.vertices[side], triangle.vertices[(side + 1) % 3], QRgba64::fromArgb32(color));
+			}
 
 			++i;
+		}
+
+		// The triangle a click would add, dashed until it exists
+		if (_sidePreview) {
+			const Triangle &source = idFile->triangle(_sidePreview->triangleID);
+			const QRgba64 color = QRgba64::fromArgb32(0xFFFFE040);
+			bufferLine(source.vertices[_sidePreview->side], _sidePreview->point, color, true);
+			bufferLine(source.vertices[(_sidePreview->side + 1) % 3], _sidePreview->point, color, true);
 		}
 
 		if (!_drawLine && data->hasInfFile()) {
@@ -300,7 +295,277 @@ void WalkmeshGLWidget::paintGL()
 		}
 
 		gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 7.0f);
+
+		// The selected point (orange), and what a click would grab or add (yellow)
+		const QVector2D texcoord;
+		if (_selectedPoint) {
+			gpuRenderer->bufferVertex(toScene(*_selectedPoint), QRgba64::fromArgb32(0xFFFF9000), texcoord);
+		}
+		if (_hoveredPoint) {
+			gpuRenderer->bufferVertex(toScene(*_hoveredPoint), QRgba64::fromArgb32(0xFFFFE040), texcoord);
+		}
+		if (_sidePreview) {
+			gpuRenderer->bufferVertex(toScene(_sidePreview->point), QRgba64::fromArgb32(0xFFFFE040), texcoord);
+		}
+		gpuRenderer->draw(RendererPrimitiveType::PT_POINTS, 11.0f);
 	}
+}
+
+QMatrix4x4 WalkmeshGLWidget::projectionMatrix() const
+{
+	// The mesh must land in the same rectangle as the background, so project with the
+	// SCREEN aspect and letterbox that rectangle into the widget - using the widget's own
+	// aspect made the mesh drift sideways from the background on any non-4:3 window.
+	float sx = 1.0f, sy = 1.0f;
+	screenLetterbox(sx, sy);
+
+	QMatrix4x4 projection;
+	projection.scale(sx, sy, 1.0f);
+	projection.perspective(fovy, float(SCREEN_WIDTH) / float(SCREEN_HEIGHT), 0.001f, 1000.0f);
+
+	return projection;
+}
+
+QMatrix4x4 WalkmeshGLWidget::viewMatrix() const
+{
+	QMatrix4x4 view;
+
+	if (data && data->hasCaFile() && data->getCaFile()->cameraCount() > 0 && camID < data->getCaFile()->cameraCount()) {
+		const Camera &cam = data->getCaFile()->camera(camID);
+
+		double camAxisXx = cam.camera_axis[0].x / 4096.0;
+		double camAxisXy = cam.camera_axis[0].y / 4096.0;
+		double camAxisXz = cam.camera_axis[0].z / 4096.0;
+
+		double camAxisYx = -cam.camera_axis[1].x / 4096.0;
+		double camAxisYy = -cam.camera_axis[1].y / 4096.0;
+		double camAxisYz = -cam.camera_axis[1].z / 4096.0;
+
+		double camAxisZx = cam.camera_axis[2].x / 4096.0;
+		double camAxisZy = cam.camera_axis[2].y / 4096.0;
+		double camAxisZz = cam.camera_axis[2].z / 4096.0;
+
+		double camPosX = cam.camera_position[0] / 4096.0;
+		double camPosY = -cam.camera_position[1] / 4096.0;
+		double camPosZ = cam.camera_position[2] / 4096.0;
+
+		double tx = -(camPosX*camAxisXx + camPosY*camAxisYx + camPosZ*camAxisZx);
+		double ty = -(camPosX*camAxisXy + camPosY*camAxisYy + camPosZ*camAxisZy);
+		double tz = -(camPosX*camAxisXz + camPosY*camAxisYz + camPosZ*camAxisZz);
+
+		const QVector3D eye(tx, ty, tz), center(tx + camAxisZx, ty + camAxisZy, tz + camAxisZz), up(camAxisYx, camAxisYy, camAxisYz);
+		view.lookAt(eye, center, up);
+	}
+
+	return view;
+}
+
+QMatrix4x4 WalkmeshGLWidget::modelMatrix() const
+{
+	QMatrix4x4 model;
+	model.translate(xTrans, yTrans, distance);
+	model.rotate(xRot, 1.0f, 0.0f, 0.0f);
+	model.rotate(yRot, 0.0f, 1.0f, 0.0f);
+	model.rotate(zRot, 0.0f, 0.0f, 1.0f);
+
+	return model;
+}
+
+// Everything picking needs goes through the matrices used for drawing, so what a click hits is
+// always exactly what is on screen
+QMatrix4x4 WalkmeshGLWidget::sceneToClip() const
+{
+	return projectionMatrix() * viewMatrix() * modelMatrix();
+}
+
+void WalkmeshGLWidget::bufferLine(const Vertex_sr &from, const Vertex_sr &to, QRgba64 color, bool dashed)
+{
+	const QVector3D a = toScene(from), b = toScene(to);
+	const QVector2D texcoord;
+
+	if (!dashed) {
+		gpuRenderer->bufferVertex(a, color, texcoord);
+		gpuRenderer->bufferVertex(b, color, texcoord);
+		return;
+	}
+
+	// Cut the line in DASHES pieces and draw every other one
+	const int DASHES = 11;
+	for (int i = 0; i < DASHES; i += 2) {
+		gpuRenderer->bufferVertex(a + (b - a) * (float(i) / DASHES), color, texcoord);
+		gpuRenderer->bufferVertex(a + (b - a) * (float(i + 1) / DASHES), color, texcoord);
+	}
+}
+
+bool WalkmeshGLWidget::toScreen(const QMatrix4x4 &sceneToClip, const Vertex_sr &point, QPointF &screen) const
+{
+	const QVector4D clip = sceneToClip * QVector4D(toScene(point), 1.0f);
+
+	if (clip.w() <= 0.0f) {
+		return false; // behind the camera
+	}
+
+	screen = QPointF((clip.x() / clip.w() + 1.0) * 0.5 * width(),
+	                 (1.0 - clip.y() / clip.w()) * 0.5 * height());
+
+	return true;
+}
+
+/**
+ * Where the mouse points on the horizontal plane at `planeHeight`: a point is dragged along the
+ * floor at its own height, so it moves over the ground seen through the game camera.
+ */
+bool WalkmeshGLWidget::mouseOnHeight(const QPoint &pos, qint16 planeHeight, Vertex_sr &point) const
+{
+	bool invertible = false;
+	const QMatrix4x4 clipToScene = sceneToClip().inverted(&invertible);
+
+	if (!invertible) {
+		return false;
+	}
+
+	// The mouse ray, from the near plane to the far plane
+	const float ndcX = 2.0f * pos.x() / width() - 1.0f, ndcY = 1.0f - 2.0f * pos.y() / height();
+	const QVector4D nearClip = clipToScene * QVector4D(ndcX, ndcY, -1.0f, 1.0f),
+	                farClip = clipToScene * QVector4D(ndcX, ndcY, 1.0f, 1.0f);
+	const QVector3D nearPoint = nearClip.toVector3D() / nearClip.w(),
+	                farPoint = farClip.toVector3D() / farClip.w();
+
+	const float planeZ = planeHeight / 4096.0f, dz = farPoint.z() - nearPoint.z();
+
+	if (qFuzzyIsNull(dz)) {
+		return false; // looking along the plane
+	}
+
+	const QVector3D hit = nearPoint + (farPoint - nearPoint) * ((planeZ - nearPoint.z()) / dz);
+
+	point.x = qint16(qBound(-32768.0f, std::round(hit.x() * 4096.0f), 32767.0f));
+	point.y = qint16(qBound(-32768.0f, std::round(hit.y() * 4096.0f), 32767.0f));
+	point.z = planeHeight;
+	point.res = 0;
+
+	return true;
+}
+
+std::optional<Vertex_sr> WalkmeshGLWidget::pointAt(const QPoint &pos, const std::optional<Vertex_sr> &ignored) const
+{
+	if (!data || !data->hasIdFile()) {
+		return std::nullopt;
+	}
+
+	const QMatrix4x4 mvp = sceneToClip();
+	std::optional<Vertex_sr> nearest;
+	qreal nearestDistance = PICK_RADIUS;
+
+	for (const Triangle &triangle: data->getIdFile()->getTriangles()) {
+		for (const Vertex_sr &vertex: triangle.vertices) {
+			QPointF screen;
+
+			if ((ignored && IdFile::samePoint(vertex, *ignored)) || !toScreen(mvp, vertex, screen)) {
+				continue;
+			}
+
+			const qreal distance = QLineF(screen, QPointF(pos)).length();
+			if (distance <= nearestDistance) {
+				nearestDistance = distance;
+				nearest = vertex;
+			}
+		}
+	}
+
+	return nearest;
+}
+
+bool WalkmeshGLWidget::isOnFloor(const QPoint &pos) const
+{
+	const QMatrix4x4 mvp = sceneToClip();
+
+	for (const Triangle &triangle: data->getIdFile()->getTriangles()) {
+		QPolygonF polygon;
+		QPointF screen;
+		bool visible = true;
+
+		for (const Vertex_sr &vertex: triangle.vertices) {
+			if (!toScreen(mvp, vertex, screen)) {
+				visible = false;
+				break;
+			}
+			polygon << screen;
+		}
+
+		if (visible && polygon.containsPoint(QPointF(pos), Qt::OddEvenFill)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+/**
+ * The triangle a click would add: on the border side (a wall) nearest to the mouse. Attaching
+ * to a side, rather than to the two nearest points, always makes a clean triangle - the two
+ * nearest points are not necessarily joined, and a triangle between them could cross others.
+ */
+std::optional<WalkmeshGLWidget::SidePreview> WalkmeshGLWidget::sidePreviewAt(const QPoint &pos) const
+{
+	const QMatrix4x4 mvp = sceneToClip();
+	IdFile *idFile = data->getIdFile();
+	int nearestTriangle = -1, nearestSide = -1;
+	qreal nearestDistance = std::numeric_limits<qreal>::max();
+
+	for (int triangleID = 0; triangleID < idFile->triangleCount(); ++triangleID) {
+		const Triangle &triangle = idFile->triangle(triangleID);
+
+		for (int side = 0; side < 3; ++side) {
+			QPointF a, b;
+
+			if (idFile->access(triangleID).a[side] != -1
+			        || !toScreen(mvp, triangle.vertices[side], a)
+			        || !toScreen(mvp, triangle.vertices[(side + 1) % 3], b)) {
+				continue;
+			}
+
+			const qreal distance = distanceToSegment(QPointF(pos), a, b);
+			if (distance < nearestDistance) {
+				nearestDistance = distance;
+				nearestTriangle = triangleID;
+				nearestSide = side;
+			}
+		}
+	}
+
+	if (nearestTriangle < 0) {
+		return std::nullopt;
+	}
+
+	// The new point sits at the height of the side it is attached to
+	const Triangle &triangle = idFile->triangle(nearestTriangle);
+	const qint16 height = qint16((triangle.vertices[nearestSide].z + triangle.vertices[(nearestSide + 1) % 3].z) / 2);
+	Vertex_sr point;
+
+	if (!mouseOnHeight(pos, height, point)) {
+		return std::nullopt;
+	}
+
+	return SidePreview{nearestTriangle, nearestSide, point};
+}
+
+void WalkmeshGLWidget::updateHover(const QPoint &pos)
+{
+	_hoveredPoint.reset();
+	_sidePreview.reset();
+
+	if (_editable && data && data->hasIdFile()) {
+		_hoveredPoint = pointAt(pos);
+
+		// Grabbing a point wins, and adding is only offered off the floor, so clicking on the
+		// floor never creates a triangle by accident
+		if (!_hoveredPoint && !isOnFloor(pos)) {
+			_sidePreview = sidePreviewAt(pos);
+		}
+	}
+
+	update();
 }
 
 void WalkmeshGLWidget::drawBackground()
@@ -359,7 +624,9 @@ void WalkmeshGLWidget::drawBackground()
 void WalkmeshGLWidget::wheelEvent(QWheelEvent *event)
 {
 	setFocus();
-	distance += event->pixelDelta().x() / 4096.0;
+	// angleDelta() is what a regular mouse wheel reports: pixelDelta() stays null for one on
+	// Windows, and its horizontal component was read, so the wheel did nothing there
+	distance += event->angleDelta().y() / 4096.0;
 	update();
 }
 
@@ -371,24 +638,113 @@ void WalkmeshGLWidget::mousePressEvent(QMouseEvent *event)
 		distance = -35;
 		update();
 	}
-	else if (event->button() == Qt::LeftButton)
+	else if (event->button() == Qt::RightButton)
 	{
+		// The view moves with the right button, leaving the left one to edit the walkmesh
 		moveStart = event->pos();
+		_panning = true;
+	}
+	else if (event->button() == Qt::LeftButton && _editable)
+	{
+		updateHover(event->pos());
+
+		if (_hoveredPoint) {
+			_selectedPoint = _draggedPoint = _hoveredPoint;
+			_dragging = true;
+			emit pointSelected(*_selectedPoint);
+			emit pointDragStarted();
+		} else if (_sidePreview) {
+			const SidePreview preview = *_sidePreview;
+			_sidePreview.reset();
+			_selectedPoint = preview.point;
+			emit pointAddRequested(preview.triangleID, preview.side, preview.point);
+			emit pointSelected(preview.point);
+		} else {
+			_selectedPoint.reset();
+		}
+
+		update();
 	}
 }
 
 void WalkmeshGLWidget::mouseMoveEvent(QMouseEvent *event)
 {
-	if (event->button() == Qt::LeftButton) {
+	// buttons(), not button(): for a move event button() is always Qt::NoButton, which is why
+	// dragging never moved the view before
+	if (_panning && (event->buttons() & Qt::RightButton)) {
 		xTrans += (event->pos().x() - moveStart.x()) / 4096.0;
 		yTrans -= (event->pos().y() - moveStart.y()) / 4096.0;
 		moveStart = event->pos();
 		update();
+	} else if (_dragging && (event->buttons() & Qt::LeftButton)) {
+		Vertex_sr target;
+
+		if (mouseOnHeight(event->pos(), _draggedPoint->z, target) && !IdFile::samePoint(target, *_draggedPoint)) {
+			emit pointDragged(*_draggedPoint, target);
+			_selectedPoint = _draggedPoint = target;
+		}
+
+		// Releasing near another point merges the two: show which one, so it never happens
+		// by surprise in a dense part of the walkmesh
+		_hoveredPoint = pointAt(event->pos(), _draggedPoint);
+		update();
+	} else {
+		updateHover(event->pos());
 	}
+}
+
+void WalkmeshGLWidget::mouseReleaseEvent(QMouseEvent *event)
+{
+	if (event->button() == Qt::RightButton) {
+		_panning = false;
+	} else if (event->button() == Qt::LeftButton && _dragging) {
+		// Dropped onto another point: snap to it, which merges the two
+		const std::optional<Vertex_sr> target = pointAt(event->pos(), _draggedPoint);
+		if (target) {
+			emit pointDragged(*_draggedPoint, *target);
+			_selectedPoint = target;
+		}
+
+		_dragging = false;
+		_draggedPoint.reset();
+		emit pointDragFinished();
+		updateHover(event->pos());
+	}
+}
+
+void WalkmeshGLWidget::leaveEvent(QEvent *event)
+{
+	_hoveredPoint.reset();
+	_sidePreview.reset();
+	update();
+	QOpenGLWidget::leaveEvent(event);
 }
 
 void WalkmeshGLWidget::keyPressEvent(QKeyEvent *event)
 {
+	// This widget grabs the keyboard while it has the focus, so shortcuts defined elsewhere would
+	// never fire: the editing keys are handled here
+	if (event->matches(QKeySequence::Undo)) {
+		emit undoRequested();
+		return;
+	}
+	if (event->matches(QKeySequence::Redo)) {
+		emit redoRequested();
+		return;
+	}
+	if (event->key() == Qt::Key_Delete) {
+		if (_editable && _selectedPoint) {
+			const Vertex_sr point = *_selectedPoint;
+			clearPointSelection();
+			emit pointDeleteRequested(point);
+		}
+		return;
+	}
+	if (event->key() == Qt::Key_Escape) {
+		clearPointSelection();
+		return;
+	}
+
 	if (lastKeyPressed == event->key()
 			&& (event->key() == Qt::Key_Left
 				|| event->key() == Qt::Key_Right

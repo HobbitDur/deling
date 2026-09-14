@@ -18,6 +18,8 @@
 #pragma once
 
 #include <QtWidgets>
+#include <QUndoStack>
+#include <functional>
 #include "widgets/PageWidget.h"
 #include "3d/WalkmeshGLWidget.h"
 #include "VertexWidget.h"
@@ -34,6 +36,7 @@ public:
 	void fill();
 	inline QString tabName() const { return tr("Walkmesh"); }
 	int currentCamera() const;
+	void restoreWalkmesh(const IdFile::Snapshot &snapshot);
 public slots:
 	void resetCamera();
 	void setCurrentCamera(int camID);
@@ -48,6 +51,15 @@ private slots:
 	void removeTriangle();
 	void editIdTriangle(const Vertex &values);
 	void editIdAccess(int value);
+	void selectTriangleOfPoint(const Vertex_sr &point);
+	void startPointDrag();
+	void dragPoint(const Vertex_sr &from, const Vertex_sr &to);
+	void finishPointDrag();
+	void addPoint(int triangleID, int side, const Vertex_sr &point);
+	void deletePoint(const Vertex_sr &point);
+	void undoWalkmeshEdit();
+	void redoWalkmeshEdit();
+	void updateEditable();
     void setCurrentGateway(int id);
 	void setCurrentDoor(int id);
 	void editExitPoint(const Vertex &values);
@@ -89,8 +101,14 @@ private:
 	void editRange1(int id, int v);
 	void editRange2(int id, int v);
 	void editUnknownGate(int id, int val);
+	void applyWalkmeshEdit(const QString &text, const std::function<bool(IdFile *)> &edit);
+	void pushWalkmeshEdit(const QString &text, const IdFile::Snapshot &before);
+	void fillTriangleList();
 
 	WalkmeshGLWidget *walkmeshGL;
+	QWidget *walkmeshPage;
+	QUndoStack *undoStack;
+	IdFile::Snapshot dragBefore;
 	QCheckBox *showBackground;
 	QSlider *slider1, *slider2, *slider3;
 	QTabWidget *tabWidget;

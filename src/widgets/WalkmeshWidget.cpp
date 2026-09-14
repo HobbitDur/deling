@@ -20,10 +20,37 @@
 #include "Config.h"
 #include "ListWidget.h"
 
+/**
+ * One undoable walkmesh edit, kept as the whole walkmesh before and after it. A walkmesh is a few
+ * hundred triangles at most (about 15 KB), so this is simpler and safer than recording each kind
+ * of change together with its inverse.
+ */
+class WalkmeshEditCommand : public QUndoCommand
+{
+public:
+	WalkmeshEditCommand(WalkmeshWidget *page, const QString &text,
+	                    const IdFile::Snapshot &before, const IdFile::Snapshot &after) :
+	    QUndoCommand(text), _page(page), _before(before), _after(after)
+	{
+	}
+	void undo() override
+	{
+		_page->restoreWalkmesh(_before);
+	}
+	void redo() override
+	{
+		_page->restoreWalkmesh(_after);
+	}
+private:
+	WalkmeshWidget *_page;
+	IdFile::Snapshot _before, _after;
+};
+
 WalkmeshWidget::WalkmeshWidget(QWidget *parent) :
-	PageWidget(parent)
+	PageWidget(parent), walkmeshPage(nullptr)
 {
 	walkmeshGL = new WalkmeshGLWidget(this);
+	undoStack = new QUndoStack(this);
 }
 
 void WalkmeshWidget::build()
@@ -53,7 +80,7 @@ void WalkmeshWidget::build()
 
 	tabWidget = new QTabWidget(this);
 	tabWidget->addTab(buildCameraPage(), tr("Camera"));
-	tabWidget->addTab(buildWalkmeshPage(), tr("Walkmesh"));
+	tabWidget->addTab(walkmeshPage = buildWalkmeshPage(), tr("Walkmesh"));
 	tabWidget->addTab(buildGatewaysPage(), tr("Exits"));
 	tabWidget->addTab(buildDoorsPage(), tr("Doors"));
 	tabWidget->addTab(buildCameraRangePage(), tr("Camera Ranges"));
@@ -78,6 +105,17 @@ void WalkmeshWidget::build()
 	connect(slider3, SIGNAL(valueChanged(int)), walkmeshGL, SLOT(setZRotation(int)));
 	connect(resetCamera, SIGNAL(clicked()), SLOT(resetCamera()));
 	connect(showBackground, SIGNAL(toggled(bool)), walkmeshGL, SLOT(setBackgroundVisible(bool)));
+
+	// Editing the walkmesh with the mouse
+	connect(tabWidget, &QTabWidget::currentChanged, this, &WalkmeshWidget::updateEditable);
+	connect(walkmeshGL, &WalkmeshGLWidget::pointSelected, this, &WalkmeshWidget::selectTriangleOfPoint);
+	connect(walkmeshGL, &WalkmeshGLWidget::pointDragStarted, this, &WalkmeshWidget::startPointDrag);
+	connect(walkmeshGL, &WalkmeshGLWidget::pointDragged, this, &WalkmeshWidget::dragPoint);
+	connect(walkmeshGL, &WalkmeshGLWidget::pointDragFinished, this, &WalkmeshWidget::finishPointDrag);
+	connect(walkmeshGL, &WalkmeshGLWidget::pointAddRequested, this, &WalkmeshWidget::addPoint);
+	connect(walkmeshGL, &WalkmeshGLWidget::pointDeleteRequested, this, &WalkmeshWidget::deletePoint);
+	connect(walkmeshGL, &WalkmeshGLWidget::undoRequested, this, &WalkmeshWidget::undoWalkmeshEdit);
+	connect(walkmeshGL, &WalkmeshGLWidget::redoRequested, this, &WalkmeshWidget::redoWalkmeshEdit);
 
 	PageWidget::build();
 }
@@ -183,6 +221,14 @@ QWidget *WalkmeshWidget::buildWalkmeshPage()
 	idAccess[1]->setRange(-32768, 32767);
 	idAccess[2]->setRange(-32768, 32767);
 
+	// Which triangle lies across each side is worked out from the points triangles share, and
+	// redone after every edit, so these are only shown
+	for (QSpinBox *access: idAccess) {
+		access->setReadOnly(true);
+		access->setButtonSymbols(QAbstractSpinBox::NoButtons);
+		access->setToolTip(tr("Computed from the points the triangles share (-1: wall)"));
+	}
+
 	QHBoxLayout *accessLayout0 = new QHBoxLayout;
 	accessLayout0->addWidget(new QLabel(tr("Triangle accessible via the line 1-2:")));
 	accessLayout0->addWidget(idAccess[0]);
@@ -195,8 +241,14 @@ QWidget *WalkmeshWidget::buildWalkmeshPage()
 	accessLayout2->addWidget(new QLabel(tr("Triangle accessible via la ligne 3-1:")));
 	accessLayout2->addWidget(idAccess[2]);
 
+	QLabel *editInfos = new QLabel(tr("Drag a point to move it. Click outside the floor to add a triangle. "
+	                                  "Delete removes the selected point. Right-drag moves the view, "
+	                                  "Ctrl+Z / Ctrl+Y undo and redo."));
+	editInfos->setTextFormat(Qt::PlainText);
+	editInfos->setWordWrap(true);
+
 	QGridLayout *layout = new QGridLayout(ret);
-	layout->addWidget(listWidget, 0, 0, 7, 1, Qt::AlignLeft);
+	layout->addWidget(listWidget, 0, 0, 8, 1, Qt::AlignLeft);
 	layout->addWidget(new QLabel(tr("Point 1:")), 0, 1);
 	layout->addWidget(idVertices[0], 0, 2);
 	layout->addWidget(new QLabel(tr("Point 2:")), 1, 1);
@@ -206,7 +258,8 @@ QWidget *WalkmeshWidget::buildWalkmeshPage()
 	layout->addLayout(accessLayout0, 3, 1, 1, 2);
 	layout->addLayout(accessLayout1, 4, 1, 1, 2);
 	layout->addLayout(accessLayout2, 5, 1, 1, 2);
-	layout->setRowStretch(6, 1);
+	layout->addWidget(editInfos, 6, 1, 1, 2);
+	layout->setRowStretch(7, 1);
 
 	connect(idList, SIGNAL(currentRowChanged(int)), SLOT(setCurrentId(int)));
 	connect(idVertices[0], SIGNAL(valuesChanged(Vertex)), SLOT(editIdTriangle(Vertex)));
@@ -436,6 +489,7 @@ void WalkmeshWidget::clear()
 	if (!isFilled())		return;
 
 	walkmeshGL->clear();
+	undoStack->clear();
 
 	blockSignals(true);
 	camList->clear();
@@ -464,7 +518,7 @@ void WalkmeshWidget::setReadOnly(bool ro)
 		idToolbar->setDisabled(ro);
 		for (int i = 0; i < 3; ++i) {
 			idVertices[i]->setReadOnly(ro);
-			idAccess[i]->setReadOnly(ro);
+			// idAccess stays read-only: adjacency is computed, never typed
 		}
 		// GatePage
 		exitPoints[0]->setReadOnly(ro);
@@ -494,6 +548,10 @@ void WalkmeshWidget::setReadOnly(bool ro)
 	}
 
 	PageWidget::setReadOnly(ro);
+
+	if (isBuilded()) {
+		updateEditable();
+	}
 }
 
 void WalkmeshWidget::fill()
@@ -529,16 +587,7 @@ void WalkmeshWidget::fill()
 	tabWidget->widget(0)->setEnabled(data()->hasCaFile() && camCount > 0);
 
 	if (data()->hasIdFile()) {
-		int triangleCount = data()->getIdFile()->triangleCount();
-
-		if (idList->count() != triangleCount) {
-			idList->blockSignals(true);
-			idList->clear();
-			for (int i = 0; i < triangleCount; ++i) {
-				idList->addItem(tr("Triangle %1").arg(i));
-			}
-			idList->blockSignals(false);
-		}
+		fillTriangleList();
 		idList->setCurrentRow(0);
 		setCurrentId(0);
 	}
@@ -594,6 +643,26 @@ void WalkmeshWidget::fill()
 //	tabWidget->widget(5)->setEnabled(data()->hasMskFile());
 
 	PageWidget::fill();
+	updateEditable();
+}
+
+void WalkmeshWidget::fillTriangleList()
+{
+	const int triangleCount = data()->getIdFile()->triangleCount();
+
+	if (idList->count() == triangleCount) {
+		return; // the items are only numbered, there is nothing else to refresh
+	}
+
+	const int row = idList->currentRow();
+
+	idList->blockSignals(true);
+	idList->clear();
+	for (int i = 0; i < triangleCount; ++i) {
+		idList->addItem(tr("Triangle %1").arg(i));
+	}
+	idList->setCurrentRow(qMin(row, triangleCount - 1));
+	idList->blockSignals(false);
 }
 
 int WalkmeshWidget::currentCamera() const
@@ -777,43 +846,152 @@ void WalkmeshWidget::setCurrentId(int i)
 
 void WalkmeshWidget::addTriangle()
 {
-	int row = idList->currentRow();
+	const int row = idList->currentRow();
 
-	if (data()->hasIdFile()) {
-		Triangle tri;
-		Access acc;
-		if (row < data()->getIdFile()->triangleCount()) {
-			tri = data()->getIdFile()->triangle(row);
-			acc = data()->getIdFile()->access(row);
-		} else {
-			tri = Triangle();
-			acc = Access();
-		}
-		data()->getIdFile()->insertTriangle(row+1, tri, acc);
-		idList->insertItem(row+1, tr("Triangle %1").arg(row+1));
-		for (int i = row + 2; i < idList->count(); ++i) {
-			idList->item(i)->setText(tr("Triangle %1").arg(i));
-		}
-		idList->setCurrentRow(row+1);
-		emit modified();
-	}
+	applyWalkmeshEdit(tr("Add triangle"), [&](IdFile *idFile) {
+		const bool hasRow = row >= 0 && row < idFile->triangleCount();
+		idFile->insertTriangle(row + 1, hasRow ? idFile->triangle(row) : Triangle(),
+		                       hasRow ? idFile->access(row) : Access());
+		return true;
+	});
+	idList->setCurrentRow(row + 1);
 }
 
 void WalkmeshWidget::removeTriangle()
 {
-	int row = idList->currentRow();
+	const int row = idList->currentRow();
 
-	if (row < 0)		return;
-
-	if (data()->hasIdFile() && row < data()->getIdFile()->triangleCount()) {
-		data()->getIdFile()->removeTriangle(row);
-		delete idList->item(row);
-		for (int i = row; i < idList->count(); ++i) {
-			idList->item(i)->setText(tr("Triangle %1").arg(i));
+	applyWalkmeshEdit(tr("Remove triangle"), [&](IdFile *idFile) {
+		if (row < 0 || row >= idFile->triangleCount()) {
+			return false;
 		}
-		setCurrentId(row);
-		emit modified();
+		idFile->removeTriangles({row});
+		return true;
+	});
+}
+
+void WalkmeshWidget::selectTriangleOfPoint(const Vertex_sr &point)
+{
+	if (!hasData() || !data()->hasIdFile()) {
+		return;
 	}
+
+	// Keep the current triangle when it uses the point, so the form does not jump around
+	const QList<int> triangleIDs = data()->getIdFile()->trianglesUsingPoint(point);
+	if (!triangleIDs.isEmpty() && !triangleIDs.contains(idList->currentRow())) {
+		idList->setCurrentRow(triangleIDs.first());
+	}
+}
+
+// A drag is one undo step: the walkmesh is saved when it starts, and the edit recorded when the
+// point is released, however many times it moved in between
+void WalkmeshWidget::startPointDrag()
+{
+	dragBefore = data()->getIdFile()->snapshot();
+}
+
+void WalkmeshWidget::dragPoint(const Vertex_sr &from, const Vertex_sr &to)
+{
+	data()->getIdFile()->movePoint(from, to);
+	setCurrentId(idList->currentRow()); // keeps the numbers in the form following the drag
+	walkmeshGL->update();
+}
+
+void WalkmeshWidget::finishPointDrag()
+{
+	pushWalkmeshEdit(tr("Move point"), dragBefore);
+}
+
+void WalkmeshWidget::addPoint(int triangleID, int side, const Vertex_sr &point)
+{
+	int newTriangleID = -1;
+
+	applyWalkmeshEdit(tr("Add point"), [&](IdFile *idFile) {
+		newTriangleID = idFile->addTriangleOnSide(triangleID, side, point);
+		return newTriangleID >= 0;
+	});
+
+	if (newTriangleID < 0) {
+		walkmeshGL->clearPointSelection(); // the point was on the side's line: nothing to add
+	}
+}
+
+void WalkmeshWidget::deletePoint(const Vertex_sr &point)
+{
+	applyWalkmeshEdit(tr("Delete point"), [&](IdFile *idFile) {
+		const QList<int> triangleIDs = idFile->trianglesUsingPoint(point);
+		if (triangleIDs.isEmpty()) {
+			return false;
+		}
+		idFile->removeTriangles(triangleIDs);
+		return true;
+	});
+}
+
+void WalkmeshWidget::undoWalkmeshEdit()
+{
+	walkmeshGL->clearPointSelection(); // the selected point may not exist in the restored walkmesh
+	undoStack->undo();
+}
+
+void WalkmeshWidget::redoWalkmeshEdit()
+{
+	walkmeshGL->clearPointSelection();
+	undoStack->redo();
+}
+
+// Points are edited on the Walkmesh tab only: the same view is shown on the camera, exits and
+// doors tabs, where a click is not meant to change the walkmesh
+void WalkmeshWidget::updateEditable()
+{
+	walkmeshGL->setEditable(tabWidget->currentWidget() == walkmeshPage && !isReadOnly()
+	                        && hasData() && data()->hasIdFile());
+}
+
+void WalkmeshWidget::applyWalkmeshEdit(const QString &text, const std::function<bool(IdFile *)> &edit)
+{
+	if (!hasData() || !data()->hasIdFile()) {
+		return;
+	}
+
+	const IdFile::Snapshot before = data()->getIdFile()->snapshot();
+
+	if (edit(data()->getIdFile())) {
+		pushWalkmeshEdit(text, before);
+	}
+}
+
+void WalkmeshWidget::pushWalkmeshEdit(const QString &text, const IdFile::Snapshot &before)
+{
+	IdFile *idFile = data()->getIdFile();
+
+	// Which triangle is next to which follows from the points they share, so it is worked out
+	// again after every edit instead of being typed
+	idFile->rebuildAccess();
+
+	const IdFile::Snapshot after = idFile->snapshot();
+	if (after == before) {
+		return;
+	}
+
+	undoStack->push(new WalkmeshEditCommand(this, text, before, after)); // push() applies it
+}
+
+void WalkmeshWidget::restoreWalkmesh(const IdFile::Snapshot &snapshot)
+{
+	if (!hasData() || !data()->hasIdFile()) {
+		return;
+	}
+
+	data()->getIdFile()->restore(snapshot);
+	fillTriangleList();
+
+	if (idList->count() > 0) {
+		setCurrentId(qMax(0, idList->currentRow()));
+	}
+
+	walkmeshGL->update();
+	emit modified();
 }
 
 void WalkmeshWidget::editIdTriangle(const Vertex &values)
@@ -827,19 +1005,28 @@ void WalkmeshWidget::editIdTriangle(const Vertex &values)
 
 void WalkmeshWidget::editIdTriangle(int id, const Vertex &values)
 {
-	if (data()->hasIdFile()) {
-		const int triangleID = idList->currentRow();
-		if (triangleID > -1 && triangleID < data()->getIdFile()->triangleCount()) {
-			Triangle old = data()->getIdFile()->triangle(triangleID);
-			Vertex_sr &oldV = old.vertices[id];
-			if (oldV.x != values.x || oldV.y != values.y || oldV.z != values.z) {
-				oldV = IdFile::fromVertex_s(values);
-				data()->getIdFile()->setTriangle(triangleID, old);
-				walkmeshGL->update();
-				emit modified();
-			}
-		}
+	if (!data()->hasIdFile()) {
+		return;
 	}
+
+	const int triangleID = idList->currentRow();
+	if (triangleID < 0 || triangleID >= data()->getIdFile()->triangleCount()) {
+		return;
+	}
+
+	const Vertex_sr from = data()->getIdFile()->triangle(triangleID).vertices[id],
+	                to = IdFile::fromVertex_s(values);
+
+	// Also filters out the form refreshing itself, since setValues() emits valuesChanged()
+	if (IdFile::samePoint(from, to)) {
+		return;
+	}
+
+	// A point typed in moves like a dragged one: every triangle sharing it follows
+	applyWalkmeshEdit(tr("Move point"), [&](IdFile *idFile) {
+		idFile->movePoint(from, to);
+		return true;
+	});
 }
 
 void WalkmeshWidget::editIdAccess(int value)

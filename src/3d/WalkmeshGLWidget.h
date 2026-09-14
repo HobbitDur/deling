@@ -18,6 +18,7 @@
 #pragma once
 
 #include <QtWidgets>
+#include <optional>
 #include "Field.h"
 #include "Renderer.h"
 
@@ -30,6 +31,19 @@ public:
 	void clear();
 	void fill(Field *data);
 	void updatePerspective();
+	void setEditable(bool editable);
+	void clearPointSelection();
+signals:
+	// Walkmesh edition with the mouse. This widget only works out what the user points at;
+	// changing the walkmesh is left to the page, so every change goes through its undo stack.
+	void pointSelected(const Vertex_sr &point);
+	void pointDragStarted();
+	void pointDragged(const Vertex_sr &from, const Vertex_sr &to);
+	void pointDragFinished();
+	void pointAddRequested(int triangleID, int side, const Vertex_sr &point);
+	void pointDeleteRequested(const Vertex_sr &point);
+	void undoRequested();
+	void redoRequested();
 public slots:
 	void setXRotation(int);
 	void setYRotation(int);
@@ -46,9 +60,28 @@ public slots:
 private:
 	// The screen the game projects a field into; its centre (160, 112) is the projection centre
 	static const int SCREEN_WIDTH = 320, SCREEN_HEIGHT = 224;
+	// How close to a point, in pixels, the mouse has to be to grab it
+	static const int PICK_RADIUS = 10;
+	// The triangle a click would add while the mouse is off the floor: a border side and a point
+	struct SidePreview {
+		int triangleID;
+		int side;
+		Vertex_sr point;
+	};
 	void screenLetterbox(float &sx, float &sy) const;
 	void computeFov();
 	void drawBackground();
+	QMatrix4x4 projectionMatrix() const;
+	QMatrix4x4 viewMatrix() const;
+	QMatrix4x4 modelMatrix() const;
+	QMatrix4x4 sceneToClip() const;
+	bool toScreen(const QMatrix4x4 &sceneToClip, const Vertex_sr &point, QPointF &screen) const;
+	bool mouseOnHeight(const QPoint &pos, qint16 planeHeight, Vertex_sr &point) const;
+	std::optional<Vertex_sr> pointAt(const QPoint &pos, const std::optional<Vertex_sr> &ignored = std::nullopt) const;
+	bool isOnFloor(const QPoint &pos) const;
+	std::optional<SidePreview> sidePreviewAt(const QPoint &pos) const;
+	void updateHover(const QPoint &pos);
+	void bufferLine(const Vertex_sr &from, const Vertex_sr &to, QRgba64 color, bool dashed = false);
 	double distance;
 	float xRot, yRot, zRot;
 	float xTrans, yTrans, transStep;
@@ -63,10 +96,12 @@ private:
 	QPoint moveStart;
 	int curFrame;
 	Renderer *gpuRenderer;
-	QMatrix4x4 mProjection;
 	QImage tex;
 	bool _drawLine;
 	bool _backgroundVisible;
+	bool _editable, _dragging, _panning;
+	std::optional<Vertex_sr> _hoveredPoint, _selectedPoint, _draggedPoint;
+	std::optional<SidePreview> _sidePreview;
 
 protected:
 	virtual void timerEvent(QTimerEvent *event) override;
@@ -76,6 +111,8 @@ protected:
 	virtual void wheelEvent(QWheelEvent *event) override;
 	virtual void mousePressEvent(QMouseEvent *event) override;
 	virtual void mouseMoveEvent(QMouseEvent *event) override;
+	virtual void mouseReleaseEvent(QMouseEvent *event) override;
+	virtual void leaveEvent(QEvent *event) override;
 	virtual void keyPressEvent(QKeyEvent *event) override;
 	virtual void focusInEvent(QFocusEvent *event) override;
 	virtual void focusOutEvent(QFocusEvent *event) override;
